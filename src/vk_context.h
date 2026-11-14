@@ -116,9 +116,6 @@ public:
     VkSampler VolumeSampler() const {
         return defaultVolumeSampler ? defaultVolumeSampler : defaultSampler;
     }
-    VkSampler EnhancedSampler() const {
-        return enhancedSampler ? enhancedSampler : defaultSampler;
-    }
     VkImageView DefaultView() const { return defaultView; }
     VkImageView DefaultCubeView() const { return defaultCubeView; }
     VkBuffer DummyVertexBuffer() const { return dummyVb; }
@@ -228,7 +225,6 @@ private:
     VmaAllocation defaultVolumeAlloc = VK_NULL_HANDLE;
     VkImageView defaultVolumeView = VK_NULL_HANDLE;
     VkSampler defaultVolumeSampler = VK_NULL_HANDLE;
-    VkSampler enhancedSampler = VK_NULL_HANDLE;
     VkBuffer dummyVb = VK_NULL_HANDLE;
     VmaAllocation dummyVbAlloc = VK_NULL_HANDLE;
     bool vsyncEnabled = true;

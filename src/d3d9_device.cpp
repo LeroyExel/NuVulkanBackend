@@ -720,8 +720,7 @@ static uint32_t __stdcall Dev_SetTexture(void*, uint32_t stage,
         g_st.shadowCompareMask &= ~(1u << stage);
     VkSampler samp =
         t ? (t->volume ? g_backend.VolumeSampler()
-                       : (t->isEnhanced ? g_backend.EnhancedSampler()
-                                        : GetSamplerForStage(stage, depthCmp)))
+                       : GetSamplerForStage(stage, depthCmp))
           : g_backend.DefaultSampler();
     g_backend.SetTextureSlot(stage, t ? t->view : VK_NULL_HANDLE, samp,
                              t ? t->cube : false, t ? t->volume : false);
@@ -867,8 +866,7 @@ static uint32_t __stdcall Dev_SetSamplerState(void*, uint32_t stage,
         !t->cube && !t->volume && IsShadowCompareD3DFormat(t->d3dFormat);
     VkSampler samp =
         t->volume ? g_backend.VolumeSampler()
-                  : (t->isEnhanced ? g_backend.EnhancedSampler()
-                                   : GetSamplerForStage(stage, depthCmp));
+                  : GetSamplerForStage(stage, depthCmp);
     g_backend.SetTextureSlot(stage, t->view, samp, t->cube, t->volume);
     return 0;
 }
@@ -951,8 +949,7 @@ static uint32_t __stdcall S_Apply(FakeStateBlock* b) {
         if (depthCmp) cmpMask |= (1u << i);
         VkSampler samp =
             t ? (t->volume ? g_backend.VolumeSampler()
-                           : (t->isEnhanced ? g_backend.EnhancedSampler()
-                                            : GetSamplerForStage(i, depthCmp)))
+                           : GetSamplerForStage(i, depthCmp))
               : g_backend.DefaultSampler();
         g_backend.SetTextureSlot(i, t ? t->view : VK_NULL_HANDLE, samp,
                                  t ? t->cube : false, t ? t->volume : false);
