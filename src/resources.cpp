@@ -1389,7 +1389,11 @@ struct DdsHeader {
 };
 
 static bool LoadDdsTexture(const char* path, uint32_t& outW, uint32_t& outH,
-                           VkFormat& outFmt, std::vector<uint8_t>& outPixels) {
+                           uint32_t& outLevels, VkFormat& outFmt,
+                           std::vector<uint32_t>& outMipOffsets,
+                           std::vector<uint32_t>& outMipWidths,
+                           std::vector<uint32_t>& outMipHeights,
+                           std::vector<uint8_t>& outPixels) {
     FILE* f = nullptr;
     if (fopen_s(&f, path, "rb") != 0 || !f) return false;
     uint32_t magic = 0;
@@ -1404,36 +1408,60 @@ static bool LoadDdsTexture(const char* path, uint32_t& outW, uint32_t& outH,
     }
     outW = hdr.width;
     outH = hdr.height;
+    uint32_t mips = hdr.mipMapCount ? hdr.mipMapCount : 1u;
+    bool isBgra = false, isRgba = false, isBc3 = false, isBc1 = false;
     if (hdr.ddspf.flags & 0x40u) {
         if (hdr.ddspf.rgbBitCount == 32u) {
-            outFmt = (hdr.ddspf.rBitMask == 0x00FF0000u)
-                         ? VK_FORMAT_B8G8R8A8_UNORM
-                         : VK_FORMAT_R8G8B8A8_UNORM;
-            const uint32_t bytes = outW * outH * 4u;
-            outPixels.resize(bytes);
-            const size_t readBytes = fread(outPixels.data(), 1, bytes, f);
-            fclose(f);
-            return readBytes == bytes;
+            if (hdr.ddspf.rBitMask == 0x00FF0000u) {
+                outFmt = VK_FORMAT_B8G8R8A8_UNORM;
+                isBgra = true;
+            } else {
+                outFmt = VK_FORMAT_R8G8B8A8_UNORM;
+                isRgba = true;
+            }
         }
     } else if (hdr.ddspf.flags & 0x4u) {
         if (hdr.ddspf.fourCC == 0x35545844u) {
             outFmt = VK_FORMAT_BC3_UNORM_BLOCK;
-            const uint32_t bytes = ((outW + 3u) / 4u) * ((outH + 3u) / 4u) * 16u;
-            outPixels.resize(bytes);
-            const size_t readBytes = fread(outPixels.data(), 1, bytes, f);
-            fclose(f);
-            return readBytes == bytes;
+            isBc3 = true;
         } else if (hdr.ddspf.fourCC == 0x31545844u) {
             outFmt = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
-            const uint32_t bytes = ((outW + 3u) / 4u) * ((outH + 3u) / 4u) * 8u;
-            outPixels.resize(bytes);
-            const size_t readBytes = fread(outPixels.data(), 1, bytes, f);
-            fclose(f);
-            return readBytes == bytes;
+            isBc1 = true;
         }
     }
+    if (!isBgra && !isRgba && !isBc3 && !isBc1) {
+        fclose(f);
+        return false;
+    }
+
+    outMipOffsets.clear();
+    outMipWidths.clear();
+    outMipHeights.clear();
+    uint32_t totalBytes = 0;
+    for (uint32_t m = 0; m < mips; ++m) {
+        uint32_t mw = outW >> m;
+        uint32_t mh = outH >> m;
+        if (!mw) mw = 1u;
+        if (!mh) mh = 1u;
+        uint32_t mBytes = 0;
+        if (isBgra || isRgba) {
+            mBytes = mw * mh * 4u;
+        } else if (isBc3) {
+            mBytes = ((mw + 3u) / 4u) * ((mh + 3u) / 4u) * 16u;
+        } else if (isBc1) {
+            mBytes = ((mw + 3u) / 4u) * ((mh + 3u) / 4u) * 8u;
+        }
+        outMipOffsets.push_back(totalBytes);
+        outMipWidths.push_back(mw);
+        outMipHeights.push_back(mh);
+        totalBytes += mBytes;
+    }
+
+    outLevels = mips;
+    outPixels.resize(totalBytes);
+    const size_t readBytes = fread(outPixels.data(), 1, totalBytes, f);
     fclose(f);
-    return false;
+    return readBytes == totalBytes;
 }
 
 static void DecompressDxt5Block(const uint8_t* block, uint32_t* out4x4) {
@@ -1528,89 +1556,103 @@ static void DecompressDxt5(const uint8_t* src, uint32_t w, uint32_t h,
     }
 }
 
-static float CatmullRom(float p0, float p1, float p2, float p3, float t) {
-    float a0 = -0.5f * p0 + 1.5f * p1 - 1.5f * p2 + 0.5f * p3;
-    float a1 = p0 - 2.5f * p1 + 2.0f * p2 - 0.5f * p3;
-    float a2 = -0.5f * p0 + 0.5f * p2;
-    float a3 = p1;
-    float v = ((a0 * t + a1) * t + a2) * t + a3;
-    return v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v);
+static inline uint32_t DiffColor(uint32_t c1, uint32_t c2) {
+    int dr = (int)((c1 >> 16) & 0xFF) - (int)((c2 >> 16) & 0xFF);
+    int dg = (int)((c1 >> 8) & 0xFF) - (int)((c2 >> 8) & 0xFF);
+    int db = (int)(c1 & 0xFF) - (int)(c2 & 0xFF);
+    int da = (int)((c1 >> 24) & 0xFF) - (int)((c2 >> 24) & 0xFF);
+    return (uint32_t)(dr * dr + dg * dg + db * db + da * da);
 }
 
-static void UpscaleAndSharpen2x(const std::vector<uint32_t>& src, uint32_t sw,
-                               uint32_t sh, std::vector<uint8_t>& dstBytes) {
+static inline uint32_t Blend2(uint32_t a, uint32_t b) {
+    uint32_t ra = ((a >> 16) & 0xFF) + ((b >> 16) & 0xFF);
+    uint32_t ga = ((a >> 8) & 0xFF) + ((b >> 8) & 0xFF);
+    uint32_t ba = (a & 0xFF) + (b & 0xFF);
+    uint32_t aa = ((a >> 24) & 0xFF) + ((b >> 24) & 0xFF);
+    return ((aa >> 1) << 24) | ((ra >> 1) << 16) | ((ga >> 1) << 8) | (ba >> 1);
+}
+
+static inline uint32_t Blend3(uint32_t a, uint32_t b, uint32_t c) {
+    uint32_t ra = ((a >> 16) & 0xFF) * 2 + ((b >> 16) & 0xFF) + ((c >> 16) & 0xFF);
+    uint32_t ga = ((a >> 8) & 0xFF) * 2 + ((b >> 8) & 0xFF) + ((c >> 8) & 0xFF);
+    uint32_t ba = (a & 0xFF) * 2 + (b & 0xFF) + (c & 0xFF);
+    uint32_t aa = ((a >> 24) & 0xFF) * 2 + ((b >> 24) & 0xFF) + ((c >> 24) & 0xFF);
+    return ((aa >> 2) << 24) | ((ra >> 2) << 16) | ((ga >> 2) << 8) | (ba >> 2);
+}
+
+static void EdgeDirectedUpscale2x(const std::vector<uint32_t>& src, uint32_t sw,
+                                  uint32_t sh, std::vector<uint8_t>& dstBytes) {
     const uint32_t dw = sw * 2u;
     const uint32_t dh = sh * 2u;
-    std::vector<uint32_t> temp(dw * dh);
+    dstBytes.resize(dw * dh * 4u);
+    uint32_t* out = (uint32_t*)dstBytes.data();
 
-    auto getSample = [&](int x, int y, int ch) -> float {
+    auto getP = [&](int x, int y) -> uint32_t {
         if (x < 0) x = 0;
         if (x >= (int)sw) x = (int)sw - 1;
         if (y < 0) y = 0;
         if (y >= (int)sh) y = (int)sh - 1;
-        uint32_t p = src[(uint32_t)y * sw + (uint32_t)x];
-        return (float)((p >> (ch * 8)) & 0xFFu);
+        return src[(uint32_t)y * sw + (uint32_t)x];
     };
 
-    for (uint32_t dy = 0; dy < dh; ++dy) {
-        float sy = ((float)dy + 0.5f) * 0.5f - 0.5f;
-        int iy = (int)floorf(sy);
-        float ty = sy - (float)iy;
-        for (uint32_t dx = 0; dx < dw; ++dx) {
-            float sx = ((float)dx + 0.5f) * 0.5f - 0.5f;
-            int ix = (int)floorf(sx);
-            float tx = sx - (float)ix;
+    for (uint32_t y = 0; y < sh; ++y) {
+        int iy = (int)y;
+        for (uint32_t x = 0; x < sw; ++x) {
+            int ix = (int)x;
+            uint32_t a = getP(ix - 1, iy - 1);
+            uint32_t b = getP(ix,     iy - 1);
+            uint32_t c = getP(ix + 1, iy - 1);
+            uint32_t d = getP(ix - 1, iy);
+            uint32_t e = getP(ix,     iy);
+            uint32_t f = getP(ix + 1, iy);
+            uint32_t g = getP(ix - 1, iy + 1);
+            uint32_t h = getP(ix,     iy + 1);
+            uint32_t i = getP(ix + 1, iy + 1);
 
-            uint32_t pix = 0;
-            for (int ch = 0; ch < 4; ++ch) {
-                float col[4];
-                for (int m = 0; m < 4; ++m) {
-                    float s0 = getSample(ix - 1, iy - 1 + m, ch);
-                    float s1 = getSample(ix + 0, iy - 1 + m, ch);
-                    float s2 = getSample(ix + 1, iy - 1 + m, ch);
-                    float s3 = getSample(ix + 2, iy - 1 + m, ch);
-                    col[m] = CatmullRom(s0, s1, s2, s3, tx);
-                }
-                float val = CatmullRom(col[0], col[1], col[2], col[3], ty);
-                uint32_t uval = (uint32_t)(val + 0.5f);
-                if (uval > 255u) uval = 255u;
-                pix |= (uval << (ch * 8));
-            }
-            temp[dy * dw + dx] = pix;
-        }
-    }
+            uint32_t d00, d10, d01, d11;
 
-    dstBytes.resize(dw * dh * 4u);
-    uint32_t* outWords = (uint32_t*)dstBytes.data();
+            uint32_t diff_diag1 = DiffColor(a, e);
+            uint32_t diff_diag2 = DiffColor(b, d);
+            if (diff_diag2 * 2u < diff_diag1)
+                d00 = Blend3(Blend2(b, d), e, e);
+            else if (diff_diag1 * 2u < diff_diag2)
+                d00 = Blend3(a, e, e);
+            else
+                d00 = Blend3(e, b, d);
 
-    for (uint32_t y = 0; y < dh; ++y) {
-        for (uint32_t x = 0; x < dw; ++x) {
-            uint32_t c = temp[y * dw + x];
-            uint32_t n = temp[(y > 0 ? y - 1 : 0) * dw + x];
-            uint32_t s = temp[(y + 1 < dh ? y + 1 : dh - 1) * dw + x];
-            uint32_t w = temp[y * dw + (x > 0 ? x - 1 : 0)];
-            uint32_t e = temp[y * dw + (x + 1 < dw ? x + 1 : dw - 1)];
+            diff_diag1 = DiffColor(c, e);
+            diff_diag2 = DiffColor(b, f);
+            if (diff_diag2 * 2u < diff_diag1)
+                d10 = Blend3(Blend2(b, f), e, e);
+            else if (diff_diag1 * 2u < diff_diag2)
+                d10 = Blend3(c, e, e);
+            else
+                d10 = Blend3(e, b, f);
 
-            uint8_t a = (uint8_t)((c >> 24) & 0xFFu);
-            uint8_t r = (uint8_t)((c >> 16) & 0xFFu);
-            uint8_t g = (uint8_t)((c >> 8) & 0xFFu);
-            uint8_t b = (uint8_t)(c & 0xFFu);
+            diff_diag1 = DiffColor(g, e);
+            diff_diag2 = DiffColor(d, h);
+            if (diff_diag2 * 2u < diff_diag1)
+                d01 = Blend3(Blend2(d, h), e, e);
+            else if (diff_diag1 * 2u < diff_diag2)
+                d01 = Blend3(g, e, e);
+            else
+                d01 = Blend3(e, d, h);
 
-            if (r < 22 && g < 22 && b < 22) {
-                r = 0; g = 0; b = 0;
-            } else {
-                float br = (float)(((n >> 16) & 0xFF) + ((s >> 16) & 0xFF) + ((w >> 16) & 0xFF) + ((e >> 16) & 0xFF)) * 0.25f;
-                float bg = (float)(((n >> 8) & 0xFF) + ((s >> 8) & 0xFF) + ((w >> 8) & 0xFF) + ((e >> 8) & 0xFF)) * 0.25f;
-                float bb = (float)((n & 0xFF) + (s & 0xFF) + (w & 0xFF) + (e & 0xFF)) * 0.25f;
-                float sr = (float)r + 0.6f * ((float)r - br);
-                float sg = (float)g + 0.6f * ((float)g - bg);
-                float sb = (float)b + 0.6f * ((float)b - bb);
-                r = (uint8_t)(sr < 0.0f ? 0 : (sr > 255.0f ? 255 : (int)(sr + 0.5f)));
-                g = (uint8_t)(sg < 0.0f ? 0 : (sg > 255.0f ? 255 : (int)(sg + 0.5f)));
-                b = (uint8_t)(sb < 0.0f ? 0 : (sb > 255.0f ? 255 : (int)(sb + 0.5f)));
-            }
-            outWords[y * dw + x] = ((uint32_t)a << 24) | ((uint32_t)r << 16) |
-                                  ((uint32_t)g << 8) | (uint32_t)b;
+            diff_diag1 = DiffColor(i, e);
+            diff_diag2 = DiffColor(f, h);
+            if (diff_diag2 * 2u < diff_diag1)
+                d11 = Blend3(Blend2(f, h), e, e);
+            else if (diff_diag1 * 2u < diff_diag2)
+                d11 = Blend3(i, e, e);
+            else
+                d11 = Blend3(e, f, h);
+
+            uint32_t dy = y * 2u;
+            uint32_t dx = x * 2u;
+            out[dy * dw + dx] = d00;
+            out[dy * dw + (dx + 1u)] = d10;
+            out[(dy + 1u) * dw + dx] = d01;
+            out[(dy + 1u) * dw + (dx + 1u)] = d11;
         }
     }
 }
@@ -1626,29 +1668,39 @@ bool ResourceTable::TryEnhanceTexture(GpuTexture* t, uint32_t resIndex) {
     if (!level0Bytes) return false;
     const uint64_t hash = XXH64((const uint8_t*)t->staging, level0Bytes, 0);
 
-    uint32_t enhW = 0, enhH = 0;
+    uint32_t enhW = 0, enhH = 0, enhLevels = 1;
     VkFormat enhFmt = VK_FORMAT_UNDEFINED;
+    std::vector<uint32_t> mipOffsets;
+    std::vector<uint32_t> mipWidths;
+    std::vector<uint32_t> mipHeights;
     std::vector<uint8_t> pixelData;
 
     char pathBuf[260];
     snprintf(pathBuf, sizeof(pathBuf), "textures/enhanced/%016llx.dds", hash);
-    bool loaded = LoadDdsTexture(pathBuf, enhW, enhH, enhFmt, pixelData);
+    bool loaded = LoadDdsTexture(pathBuf, enhW, enhH, enhLevels, enhFmt,
+                                 mipOffsets, mipWidths, mipHeights, pixelData);
     if (!loaded && hash == 0xfe5227ebba7c0e6full) {
         loaded = LoadDdsTexture("textures/enhanced/emmet_legal_english.dds", enhW, enhH,
-                                enhFmt, pixelData);
+                                enhLevels, enhFmt, mipOffsets, mipWidths, mipHeights,
+                                pixelData);
     }
     if (!loaded) {
         snprintf(pathBuf, sizeof(pathBuf), "textures/replacement/%016llx.dds", hash);
-        loaded = LoadDdsTexture(pathBuf, enhW, enhH, enhFmt, pixelData);
+        loaded = LoadDdsTexture(pathBuf, enhW, enhH, enhLevels, enhFmt,
+                                mipOffsets, mipWidths, mipHeights, pixelData);
     }
 
-    if (!loaded && hash == 0xfe5227ebba7c0e6full && t->d3dFormat == 0x35545844u) {
+    if (!loaded && t->d3dFormat == 0x35545844u) {
         std::vector<uint32_t> decoded;
         DecompressDxt5((const uint8_t*)t->staging, t->width, t->height, decoded);
-        UpscaleAndSharpen2x(decoded, t->width, t->height, pixelData);
+        EdgeDirectedUpscale2x(decoded, t->width, t->height, pixelData);
         enhW = t->width * 2u;
         enhH = t->height * 2u;
+        enhLevels = 1;
         enhFmt = VK_FORMAT_B8G8R8A8_UNORM;
+        mipOffsets.assign(1, 0u);
+        mipWidths.assign(1, enhW);
+        mipHeights.assign(1, enhH);
         loaded = true;
     }
 
@@ -1677,7 +1729,7 @@ bool ResourceTable::TryEnhanceTexture(GpuTexture* t, uint32_t resIndex) {
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = enhFmt;
     ici.extent = {enhW, enhH, 1};
-    ici.mipLevels = 1;
+    ici.mipLevels = enhLevels;
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -1697,7 +1749,7 @@ bool ResourceTable::TryEnhanceTexture(GpuTexture* t, uint32_t resIndex) {
     vci.image = enhImg;
     vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vci.format = enhFmt;
-    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, enhLevels, 0, 1};
     VkImageView enhView = VK_NULL_HANDLE;
     if (vkCreateImageView(g_backend.Device(), &vci, nullptr, &enhView) != VK_SUCCESS) {
         vmaDestroyImage(g_backend.Allocator(), enhImg, enhAlloc);
@@ -1708,9 +1760,11 @@ bool ResourceTable::TryEnhanceTexture(GpuTexture* t, uint32_t resIndex) {
     struct UploadData {
         VkImage img;
         VkBuffer buf;
-        uint32_t w;
-        uint32_t h;
-    } ud{enhImg, stagingBuf, enhW, enhH};
+        uint32_t levels;
+        const uint32_t* offsets;
+        const uint32_t* widths;
+        const uint32_t* heights;
+    } ud{enhImg, stagingBuf, enhLevels, mipOffsets.data(), mipWidths.data(), mipHeights.data()};
 
     g_backend.ImmediateSubmit(
         [](VkCommandBuffer cmd, void* user) {
@@ -1719,24 +1773,30 @@ bool ResourceTable::TryEnhanceTexture(GpuTexture* t, uint32_t resIndex) {
             b1.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             b1.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             b1.image = d->img;
-            b1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            b1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, d->levels, 0, 1};
             b1.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
                                  0, nullptr, 1, &b1);
 
-            VkBufferImageCopy bic{};
-            bic.bufferOffset = 0;
-            bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            bic.imageExtent = {d->w, d->h, 1};
+            std::vector<VkBufferImageCopy> bics(d->levels);
+            for (uint32_t m = 0; m < d->levels; ++m) {
+                bics[m].bufferOffset = d->offsets[m];
+                bics[m].bufferRowLength = 0;
+                bics[m].bufferImageHeight = 0;
+                bics[m].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, 1};
+                bics[m].imageOffset = {0, 0, 0};
+                bics[m].imageExtent = {d->widths[m], d->heights[m], 1};
+            }
             vkCmdCopyBufferToImage(cmd, d->buf, d->img,
-                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   (uint32_t)bics.size(), bics.data());
 
             VkImageMemoryBarrier b2{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             b2.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             b2.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             b2.image = d->img;
-            b2.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            b2.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, d->levels, 0, 1};
             b2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             b2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -1752,21 +1812,25 @@ bool ResourceTable::TryEnhanceTexture(GpuTexture* t, uint32_t resIndex) {
     if (t->view) vkDestroyImageView(g_backend.Device(), t->view, nullptr);
     if (t->image) vmaDestroyImage(g_backend.Allocator(), t->image, t->alloc);
 
+    const uint32_t origW = t->width;
+    const uint32_t origH = t->height;
     t->image = enhImg;
     t->alloc = enhAlloc;
     t->view = enhView;
-    t->levelView[0] = enhView;
     t->isEnhanced = true;
     t->format = enhFmt;
     t->width = enhW;
     t->height = enhH;
-    t->levels = 1;
-    t->levelW[0] = enhW;
-    t->levelH[0] = enhH;
-    t->levelOffset[0] = 0;
+    t->levels = enhLevels;
+    for (uint32_t m = 0; m < enhLevels && m < 16; ++m) {
+        t->levelW[m] = mipWidths[m];
+        t->levelH[m] = mipHeights[m];
+        t->levelOffset[m] = mipOffsets[m];
+        t->levelView[m] = enhView;
+    }
 
-    LOG("[res] texture enhanced: %ux%u -> %ux%u (hash=%016llx, fmt=%u)",
-        enhW / 2u, enhH / 2u, enhW, enhH, hash, (uint32_t)enhFmt);
+    LOG("[res] texture enhanced: %ux%u -> %ux%u (hash=%016llx, levels=%u, fmt=%u)",
+        origW, origH, enhW, enhH, hash, enhLevels, (uint32_t)enhFmt);
     return true;
 }
 
