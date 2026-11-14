@@ -94,6 +94,7 @@ struct GpuTexture {
     uint32_t expandBytes = 0;
     uint32_t uploadGen = 0;
     bool keepStaging = false;
+    bool isEnhanced = false;
 };
 
 struct VertexAttr {
@@ -206,6 +207,7 @@ public:
     static VkFormat ToVkDepthFormat(uint32_t d3dfmt, VkImageAspectFlags* aspect);
 
     void UpdateBackbuffer(uint32_t w, uint32_t h, uint32_t d3dfmt);
+    bool TryEnhanceTexture(GpuTexture* t, uint32_t resIndex);
 
 private:
     struct StagingSlab {

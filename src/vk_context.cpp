@@ -1128,6 +1128,7 @@ void VkBackend::Shutdown() {
     if (immediateFence) vkDestroyFence(device, immediateFence, nullptr);
     if (defaultView) vkDestroyImageView(device, defaultView, nullptr);
     if (defaultSampler) vkDestroySampler(device, defaultSampler, nullptr);
+    if (enhancedSampler) vkDestroySampler(device, enhancedSampler, nullptr);
     if (defaultImage) vmaDestroyImage(allocator, defaultImage, defaultAlloc);
     if (dummyVb) vmaDestroyBuffer(allocator, dummyVb, dummyVbAlloc);
     if (pipelineLayout) vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
@@ -1571,6 +1572,20 @@ bool VkBackend::CreateDefaultVolume() {
     vsci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     vsci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     vkCreateSampler(device, &vsci, nullptr, &defaultVolumeSampler);
+
+    VkSamplerCreateInfo esci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    esci.magFilter = VK_FILTER_LINEAR;
+    esci.minFilter = VK_FILTER_LINEAR;
+    esci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    esci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    esci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    esci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    esci.anisotropyEnable = VK_TRUE;
+    esci.maxAnisotropy = 16.0f;
+    esci.mipLodBias = -0.5f;
+    esci.minLod = 0.0f;
+    esci.maxLod = 1000.0f;
+    vkCreateSampler(device, &esci, nullptr, &enhancedSampler);
 
     ImmediateSubmit(
         [](VkCommandBuffer cmd, void* user) {

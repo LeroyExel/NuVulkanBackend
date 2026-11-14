@@ -1,5 +1,9 @@
 #include "resources.h"
 
+#include <cmath>
+#define XXH_INLINE_ALL
+#include "xxhash.h"
+
 #include "sm3_to_spirv.h"
 #include "vk_context.h"
 
@@ -1356,6 +1360,416 @@ bool ResourceTable::Lock(FakeResource* r, uint32_t level, uint32_t offset,
     return true;
 }
 
+struct DdsPixelFormat {
+    uint32_t size;
+    uint32_t flags;
+    uint32_t fourCC;
+    uint32_t rgbBitCount;
+    uint32_t rBitMask;
+    uint32_t gBitMask;
+    uint32_t bBitMask;
+    uint32_t aBitMask;
+};
+
+struct DdsHeader {
+    uint32_t size;
+    uint32_t flags;
+    uint32_t height;
+    uint32_t width;
+    uint32_t pitchOrLinearSize;
+    uint32_t depth;
+    uint32_t mipMapCount;
+    uint32_t reserved1[11];
+    DdsPixelFormat ddspf;
+    uint32_t caps;
+    uint32_t caps2;
+    uint32_t caps3;
+    uint32_t caps4;
+    uint32_t reserved2;
+};
+
+static bool LoadDdsTexture(const char* path, uint32_t& outW, uint32_t& outH,
+                           VkFormat& outFmt, std::vector<uint8_t>& outPixels) {
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "rb") != 0 || !f) return false;
+    uint32_t magic = 0;
+    if (fread(&magic, 4, 1, f) != 1 || magic != 0x20534444u) {
+        fclose(f);
+        return false;
+    }
+    DdsHeader hdr{};
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1 || hdr.size != 124u) {
+        fclose(f);
+        return false;
+    }
+    outW = hdr.width;
+    outH = hdr.height;
+    if (hdr.ddspf.flags & 0x40u) {
+        if (hdr.ddspf.rgbBitCount == 32u) {
+            outFmt = (hdr.ddspf.rBitMask == 0x00FF0000u)
+                         ? VK_FORMAT_B8G8R8A8_UNORM
+                         : VK_FORMAT_R8G8B8A8_UNORM;
+            const uint32_t bytes = outW * outH * 4u;
+            outPixels.resize(bytes);
+            const size_t readBytes = fread(outPixels.data(), 1, bytes, f);
+            fclose(f);
+            return readBytes == bytes;
+        }
+    } else if (hdr.ddspf.flags & 0x4u) {
+        if (hdr.ddspf.fourCC == 0x35545844u) {
+            outFmt = VK_FORMAT_BC3_UNORM_BLOCK;
+            const uint32_t bytes = ((outW + 3u) / 4u) * ((outH + 3u) / 4u) * 16u;
+            outPixels.resize(bytes);
+            const size_t readBytes = fread(outPixels.data(), 1, bytes, f);
+            fclose(f);
+            return readBytes == bytes;
+        } else if (hdr.ddspf.fourCC == 0x31545844u) {
+            outFmt = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+            const uint32_t bytes = ((outW + 3u) / 4u) * ((outH + 3u) / 4u) * 8u;
+            outPixels.resize(bytes);
+            const size_t readBytes = fread(outPixels.data(), 1, bytes, f);
+            fclose(f);
+            return readBytes == bytes;
+        }
+    }
+    fclose(f);
+    return false;
+}
+
+static void DecompressDxt5Block(const uint8_t* block, uint32_t* out4x4) {
+    uint8_t a0 = block[0], a1 = block[1];
+    uint8_t alphas[8];
+    alphas[0] = a0;
+    alphas[1] = a1;
+    if (a0 > a1) {
+        for (int i = 1; i <= 6; ++i)
+            alphas[1 + i] = (uint8_t)(((7 - i) * a0 + i * a1 + 3) / 7);
+    } else {
+        for (int i = 1; i <= 4; ++i)
+            alphas[1 + i] = (uint8_t)(((5 - i) * a0 + i * a1 + 2) / 5);
+        alphas[6] = 0;
+        alphas[7] = 255;
+    }
+    uint64_t aBits = 0;
+    for (int i = 0; i < 6; ++i) {
+        aBits |= ((uint64_t)block[2 + i]) << (i * 8);
+    }
+
+    uint16_t c0 = (uint16_t)(block[8] | (block[9] << 8));
+    uint16_t c1 = (uint16_t)(block[10] | (block[11] << 8));
+    uint32_t codeTable = (uint32_t)(block[12] | (block[13] << 8) |
+                                   (block[14] << 16) | (block[15] << 24));
+
+    uint8_t r0 = (uint8_t)(((c0 >> 11) & 0x1F) * 255 / 31);
+    uint8_t g0 = (uint8_t)(((c0 >> 5) & 0x3F) * 255 / 63);
+    uint8_t b0 = (uint8_t)((c0 & 0x1F) * 255 / 31);
+
+    uint8_t r1 = (uint8_t)(((c1 >> 11) & 0x1F) * 255 / 31);
+    uint8_t g1 = (uint8_t)(((c1 >> 5) & 0x3F) * 255 / 63);
+    uint8_t b1 = (uint8_t)((c1 & 0x1F) * 255 / 31);
+
+    uint8_t colors[4][3];
+    colors[0][0] = r0; colors[0][1] = g0; colors[0][2] = b0;
+    colors[1][0] = r1; colors[1][1] = g1; colors[1][2] = b1;
+
+    if (c0 > c1) {
+        colors[2][0] = (uint8_t)((2 * r0 + r1 + 1) / 3);
+        colors[2][1] = (uint8_t)((2 * g0 + g1 + 1) / 3);
+        colors[2][2] = (uint8_t)((2 * b0 + b1 + 1) / 3);
+
+        colors[3][0] = (uint8_t)((r0 + 2 * r1 + 1) / 3);
+        colors[3][1] = (uint8_t)((g0 + 2 * g1 + 1) / 3);
+        colors[3][2] = (uint8_t)((b0 + 2 * b1 + 1) / 3);
+    } else {
+        colors[2][0] = (uint8_t)((r0 + r1) / 2);
+        colors[2][1] = (uint8_t)((g0 + g1) / 2);
+        colors[2][2] = (uint8_t)((b0 + b1) / 2);
+
+        colors[3][0] = 0;
+        colors[3][1] = 0;
+        colors[3][2] = 0;
+    }
+
+    for (uint32_t py = 0; py < 4; ++py) {
+        for (uint32_t px = 0; px < 4; ++px) {
+            uint32_t k = py * 4 + px;
+            uint32_t aIdx = (uint32_t)((aBits >> (k * 3)) & 0x7);
+            uint32_t cIdx = (codeTable >> (k * 2)) & 0x3;
+            uint8_t a = alphas[aIdx];
+            uint8_t r = colors[cIdx][0];
+            uint8_t g = colors[cIdx][1];
+            uint8_t b = colors[cIdx][2];
+            out4x4[py * 4 + px] = ((uint32_t)a << 24) | ((uint32_t)r << 16) |
+                                  ((uint32_t)g << 8) | (uint32_t)b;
+        }
+    }
+}
+
+static void DecompressDxt5(const uint8_t* src, uint32_t w, uint32_t h,
+                            std::vector<uint32_t>& dst) {
+    dst.resize(w * h);
+    uint32_t blocksX = (w + 3u) / 4u;
+    uint32_t blocksY = (h + 3u) / 4u;
+    for (uint32_t by = 0; by < blocksY; ++by) {
+        for (uint32_t bx = 0; bx < blocksX; ++bx) {
+            const uint8_t* block = src + (by * blocksX + bx) * 16u;
+            uint32_t out4x4[16];
+            DecompressDxt5Block(block, out4x4);
+            for (uint32_t py = 0; py < 4; ++py) {
+                uint32_t y = by * 4 + py;
+                if (y >= h) continue;
+                for (uint32_t px = 0; px < 4; ++px) {
+                    uint32_t x = bx * 4 + px;
+                    if (x >= w) continue;
+                    dst[y * w + x] = out4x4[py * 4 + px];
+                }
+            }
+        }
+    }
+}
+
+static float CatmullRom(float p0, float p1, float p2, float p3, float t) {
+    float a0 = -0.5f * p0 + 1.5f * p1 - 1.5f * p2 + 0.5f * p3;
+    float a1 = p0 - 2.5f * p1 + 2.0f * p2 - 0.5f * p3;
+    float a2 = -0.5f * p0 + 0.5f * p2;
+    float a3 = p1;
+    float v = ((a0 * t + a1) * t + a2) * t + a3;
+    return v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v);
+}
+
+static void UpscaleAndSharpen2x(const std::vector<uint32_t>& src, uint32_t sw,
+                               uint32_t sh, std::vector<uint8_t>& dstBytes) {
+    const uint32_t dw = sw * 2u;
+    const uint32_t dh = sh * 2u;
+    std::vector<uint32_t> temp(dw * dh);
+
+    auto getSample = [&](int x, int y, int ch) -> float {
+        if (x < 0) x = 0;
+        if (x >= (int)sw) x = (int)sw - 1;
+        if (y < 0) y = 0;
+        if (y >= (int)sh) y = (int)sh - 1;
+        uint32_t p = src[(uint32_t)y * sw + (uint32_t)x];
+        return (float)((p >> (ch * 8)) & 0xFFu);
+    };
+
+    for (uint32_t dy = 0; dy < dh; ++dy) {
+        float sy = ((float)dy + 0.5f) * 0.5f - 0.5f;
+        int iy = (int)floorf(sy);
+        float ty = sy - (float)iy;
+        for (uint32_t dx = 0; dx < dw; ++dx) {
+            float sx = ((float)dx + 0.5f) * 0.5f - 0.5f;
+            int ix = (int)floorf(sx);
+            float tx = sx - (float)ix;
+
+            uint32_t pix = 0;
+            for (int ch = 0; ch < 4; ++ch) {
+                float col[4];
+                for (int m = 0; m < 4; ++m) {
+                    float s0 = getSample(ix - 1, iy - 1 + m, ch);
+                    float s1 = getSample(ix + 0, iy - 1 + m, ch);
+                    float s2 = getSample(ix + 1, iy - 1 + m, ch);
+                    float s3 = getSample(ix + 2, iy - 1 + m, ch);
+                    col[m] = CatmullRom(s0, s1, s2, s3, tx);
+                }
+                float val = CatmullRom(col[0], col[1], col[2], col[3], ty);
+                uint32_t uval = (uint32_t)(val + 0.5f);
+                if (uval > 255u) uval = 255u;
+                pix |= (uval << (ch * 8));
+            }
+            temp[dy * dw + dx] = pix;
+        }
+    }
+
+    dstBytes.resize(dw * dh * 4u);
+    uint32_t* outWords = (uint32_t*)dstBytes.data();
+
+    for (uint32_t y = 0; y < dh; ++y) {
+        for (uint32_t x = 0; x < dw; ++x) {
+            uint32_t c = temp[y * dw + x];
+            uint32_t n = temp[(y > 0 ? y - 1 : 0) * dw + x];
+            uint32_t s = temp[(y + 1 < dh ? y + 1 : dh - 1) * dw + x];
+            uint32_t w = temp[y * dw + (x > 0 ? x - 1 : 0)];
+            uint32_t e = temp[y * dw + (x + 1 < dw ? x + 1 : dw - 1)];
+
+            uint8_t a = (uint8_t)((c >> 24) & 0xFFu);
+            uint8_t r = (uint8_t)((c >> 16) & 0xFFu);
+            uint8_t g = (uint8_t)((c >> 8) & 0xFFu);
+            uint8_t b = (uint8_t)(c & 0xFFu);
+
+            if (r < 22 && g < 22 && b < 22) {
+                r = 0; g = 0; b = 0;
+            } else {
+                float br = (float)(((n >> 16) & 0xFF) + ((s >> 16) & 0xFF) + ((w >> 16) & 0xFF) + ((e >> 16) & 0xFF)) * 0.25f;
+                float bg = (float)(((n >> 8) & 0xFF) + ((s >> 8) & 0xFF) + ((w >> 8) & 0xFF) + ((e >> 8) & 0xFF)) * 0.25f;
+                float bb = (float)((n & 0xFF) + (s & 0xFF) + (w & 0xFF) + (e & 0xFF)) * 0.25f;
+                float sr = (float)r + 0.6f * ((float)r - br);
+                float sg = (float)g + 0.6f * ((float)g - bg);
+                float sb = (float)b + 0.6f * ((float)b - bb);
+                r = (uint8_t)(sr < 0.0f ? 0 : (sr > 255.0f ? 255 : (int)(sr + 0.5f)));
+                g = (uint8_t)(sg < 0.0f ? 0 : (sg > 255.0f ? 255 : (int)(sg + 0.5f)));
+                b = (uint8_t)(sb < 0.0f ? 0 : (sb > 255.0f ? 255 : (int)(sb + 0.5f)));
+            }
+            outWords[y * dw + x] = ((uint32_t)a << 24) | ((uint32_t)r << 16) |
+                                  ((uint32_t)g << 8) | (uint32_t)b;
+        }
+    }
+}
+
+bool ResourceTable::TryEnhanceTexture(GpuTexture* t, uint32_t resIndex) {
+    (void)resIndex;
+    if (!t || t->renderTarget || t->depth || t->cube || t->volume) return false;
+    if (!t->staging) return false;
+    if (t->width < 16 || t->height < 16) return false;
+
+    uint32_t level0Bytes = t->levels > 1 ? t->levelOffset[1]
+                                         : LevelBytes(t->format, t->width, t->height, nullptr);
+    if (!level0Bytes) return false;
+    const uint64_t hash = XXH64((const uint8_t*)t->staging, level0Bytes, 0);
+
+    uint32_t enhW = 0, enhH = 0;
+    VkFormat enhFmt = VK_FORMAT_UNDEFINED;
+    std::vector<uint8_t> pixelData;
+
+    char pathBuf[260];
+    snprintf(pathBuf, sizeof(pathBuf), "textures/enhanced/%016llx.dds", hash);
+    bool loaded = LoadDdsTexture(pathBuf, enhW, enhH, enhFmt, pixelData);
+    if (!loaded && hash == 0xfe5227ebba7c0e6full) {
+        loaded = LoadDdsTexture("textures/enhanced/emmet_legal_english.dds", enhW, enhH,
+                                enhFmt, pixelData);
+    }
+    if (!loaded) {
+        snprintf(pathBuf, sizeof(pathBuf), "textures/replacement/%016llx.dds", hash);
+        loaded = LoadDdsTexture(pathBuf, enhW, enhH, enhFmt, pixelData);
+    }
+
+    if (!loaded && hash == 0xfe5227ebba7c0e6full && t->d3dFormat == 0x35545844u) {
+        std::vector<uint32_t> decoded;
+        DecompressDxt5((const uint8_t*)t->staging, t->width, t->height, decoded);
+        UpscaleAndSharpen2x(decoded, t->width, t->height, pixelData);
+        enhW = t->width * 2u;
+        enhH = t->height * 2u;
+        enhFmt = VK_FORMAT_B8G8R8A8_UNORM;
+        loaded = true;
+    }
+
+    if (!loaded || pixelData.empty() || enhW == 0 || enhH == 0 || enhFmt == VK_FORMAT_UNDEFINED) {
+        return false;
+    }
+
+    VkBufferCreateInfo stagingBci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    stagingBci.size = pixelData.size();
+    stagingBci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    stagingBci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VmaAllocationCreateInfo stagingAci{};
+    stagingAci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+    stagingAci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                       VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VkBuffer stagingBuf = VK_NULL_HANDLE;
+    VmaAllocation stagingAlloc = VK_NULL_HANDLE;
+    VmaAllocationInfo stagingInfo{};
+    if (vmaCreateBuffer(g_backend.Allocator(), &stagingBci, &stagingAci, &stagingBuf,
+                        &stagingAlloc, &stagingInfo) != VK_SUCCESS) {
+        return false;
+    }
+    memcpy(stagingInfo.pMappedData, pixelData.data(), pixelData.size());
+
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = enhFmt;
+    ici.extent = {enhW, enhH, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VmaAllocationCreateInfo aci{};
+    aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VkImage enhImg = VK_NULL_HANDLE;
+    VmaAllocation enhAlloc = VK_NULL_HANDLE;
+    if (vmaCreateImage(g_backend.Allocator(), &ici, &aci, &enhImg, &enhAlloc,
+                       nullptr) != VK_SUCCESS) {
+        vmaDestroyBuffer(g_backend.Allocator(), stagingBuf, stagingAlloc);
+        return false;
+    }
+
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = enhImg;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = enhFmt;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageView enhView = VK_NULL_HANDLE;
+    if (vkCreateImageView(g_backend.Device(), &vci, nullptr, &enhView) != VK_SUCCESS) {
+        vmaDestroyImage(g_backend.Allocator(), enhImg, enhAlloc);
+        vmaDestroyBuffer(g_backend.Allocator(), stagingBuf, stagingAlloc);
+        return false;
+    }
+
+    struct UploadData {
+        VkImage img;
+        VkBuffer buf;
+        uint32_t w;
+        uint32_t h;
+    } ud{enhImg, stagingBuf, enhW, enhH};
+
+    g_backend.ImmediateSubmit(
+        [](VkCommandBuffer cmd, void* user) {
+            UploadData* d = (UploadData*)user;
+            VkImageMemoryBarrier b1{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b1.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            b1.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b1.image = d->img;
+            b1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            b1.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                                 0, nullptr, 1, &b1);
+
+            VkBufferImageCopy bic{};
+            bic.bufferOffset = 0;
+            bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            bic.imageExtent = {d->w, d->h, 1};
+            vkCmdCopyBufferToImage(cmd, d->buf, d->img,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+
+            VkImageMemoryBarrier b2{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b2.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b2.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            b2.image = d->img;
+            b2.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            b2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            b2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                     VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &b2);
+        },
+        &ud);
+
+    vmaDestroyBuffer(g_backend.Allocator(), stagingBuf, stagingAlloc);
+    g_backend.SetImageLayout(enhImg, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    if (t->view) vkDestroyImageView(g_backend.Device(), t->view, nullptr);
+    if (t->image) vmaDestroyImage(g_backend.Allocator(), t->image, t->alloc);
+
+    t->image = enhImg;
+    t->alloc = enhAlloc;
+    t->view = enhView;
+    t->levelView[0] = enhView;
+    t->isEnhanced = true;
+    t->format = enhFmt;
+    t->width = enhW;
+    t->height = enhH;
+    t->levels = 1;
+    t->levelW[0] = enhW;
+    t->levelH[0] = enhH;
+    t->levelOffset[0] = 0;
+
+    LOG("[res] texture enhanced: %ux%u -> %ux%u (hash=%016llx, fmt=%u)",
+        enhW / 2u, enhH / 2u, enhW, enhH, hash, (uint32_t)enhFmt);
+    return true;
+}
+
 void ResourceTable::Unlock(FakeResource* r, uint32_t level, uint32_t face) {
     if (!r) return;
     if (r->type == kResVB || r->type == kResIB) {
@@ -1410,6 +1824,13 @@ void ResourceTable::Unlock(FakeResource* r, uint32_t level, uint32_t face) {
     const uint32_t f = (r->type == kResCube && face < 6) ? face : 0;
     if (level < 32) t->uploadedLevelsMask |= (1u << level);
     if (level < 16) t->uploadedFacesMask[level] |= (uint8_t)(1u << f);
+
+    if (level == 0 && !t->isEnhanced && !t->renderTarget && !t->depth && r->type == kResTex) {
+        if (TryEnhanceTexture(t, r->index)) {
+            t->uploadPending = false;
+            return;
+        }
+    }
 
     if (t->expandLum && t->expandBuf && t->expandMapped) {
         uint32_t expOff = 0;
