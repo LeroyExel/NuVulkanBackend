@@ -47,8 +47,10 @@ private:
     bool CreateTarget(RenderTarget& rt, uint32_t w, uint32_t h, VkFormat fmt,
                       VkImageUsageFlags extraUsage = 0);
     void DestroyTarget(RenderTarget& rt);
-    bool EnsureTargets(uint32_t fullW, uint32_t fullH, VkFormat sceneFmt,
-                       VkFormat bbFmt);
+    bool EnsureSceneTargets(uint32_t sceneW, uint32_t sceneH, VkFormat sceneFmt);
+    bool EnsureBbTargets(uint32_t bbW, uint32_t bbH, VkFormat bbFmt);
+    void DestroySceneTargets();
+    void DestroyBbTargets();
     void DestroyTargets();
     bool EnsureGraphicsPipeline(VkShaderModule fs, VkFormat colorFmt,
                                 VkPipeline& pipe, VkFormat& pipeFmt);
@@ -75,9 +77,11 @@ private:
     uint32_t bb3dDrawCount_ = 0;
     uint32_t bbDraws_ = 0;
 
-    uint32_t allocW_ = 0;
-    uint32_t allocH_ = 0;
+    uint32_t allocSceneW_ = 0;
+    uint32_t allocSceneH_ = 0;
     VkFormat allocSceneFmt_ = VK_FORMAT_UNDEFINED;
+    uint32_t allocBbW_ = 0;
+    uint32_t allocBbH_ = 0;
     VkFormat allocBbFmt_ = VK_FORMAT_UNDEFINED;
 
     RenderTarget gtaoRaw_{};

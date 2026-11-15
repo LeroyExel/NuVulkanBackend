@@ -428,6 +428,7 @@ struct SpvFrag {
         const uint32_t iv = id();
         fnVars.op(59, {pFnS32, iv, 7, sc(startVal)});
         const uint32_t hdr = id(), bdy = id(), cnt = id(), mrg = id();
+        fnBody.op(62, {iv, sc(startVal)});
         fnBody.op(249, {hdr});
         fnBody.op(248, {hdr});
         const uint32_t iVal = id(), cond = id();
@@ -499,6 +500,8 @@ std::vector<uint32_t> BuildGtaoRawFs() {
     const uint32_t radUV = b.v2(b.div(b.tF32, screenR, b.extr(b.push1, 2)), screenR);
 
     const uint32_t visAcc = b.varF(0.0f);
+    const uint32_t maxCos1 = b.varF(-1.0f);
+    const uint32_t maxCos2 = b.varF(-1.0f);
 
     b.forLoop(0, 6, [&](uint32_t dInt) {
         const uint32_t df = b.id();
@@ -520,8 +523,8 @@ std::vector<uint32_t> BuildGtaoRawFs() {
         const uint32_t nAng = b.mul(b.tF32, nSign, b.acos(b.tF32, cosN));
         const uint32_t sinN = b.sin(b.tF32, nAng);
 
-        const uint32_t maxCos1 = b.varF(-1.0f);
-        const uint32_t maxCos2 = b.varF(-1.0f);
+        b.storeF(maxCos1, b.fcConst(-1.0f));
+        b.storeF(maxCos2, b.fcConst(-1.0f));
 
         b.forLoop(0, 4, [&](uint32_t sInt) {
             const uint32_t sf = b.id();
@@ -725,7 +728,7 @@ std::vector<uint32_t> BuildSmaaEdgesFs() {
 
     const uint32_t invW = b.extr(b.push0, 0);
     const uint32_t invH = b.extr(b.push0, 1);
-    const uint32_t lumaW = b.v3f(0.2126f, 0.7152f, 0.0722f);
+    const uint32_t lumaW = b.v3f(0.299f, 0.587f, 0.114f);
 
     auto lumaAt = [&](uint32_t dx, uint32_t dy) {
         const uint32_t tc = b.add(b.tVec2, b.uv, b.v2(dx, dy));
@@ -749,8 +752,8 @@ std::vector<uint32_t> BuildSmaaEdgesFs() {
 
     const uint32_t maxLR = b.fmax(b.tF32, b.fmax(b.tF32, dL, dR), b.fmax(b.tF32, dT, dB));
     const uint32_t max2 = b.fmax(b.tF32, maxLR, b.fmax(b.tF32, dLL, dTT));
-    const uint32_t halfMax = b.mul(b.tF32, max2, b.fcConst(0.5f));
-    const uint32_t thresh = b.fcConst(0.06f);
+    const uint32_t halfMax = b.mul(b.tF32, max2, b.fcConst(0.42f));
+    const uint32_t thresh = b.fcConst(0.045f);
 
     const uint32_t edgeH = b.mul(b.tF32, b.step(b.tF32, thresh, dT), b.step(b.tF32, halfMax, dT));
     const uint32_t edgeV = b.mul(b.tF32, b.step(b.tF32, thresh, dL), b.step(b.tF32, halfMax, dL));
@@ -773,7 +776,7 @@ std::vector<uint32_t> BuildSmaaWeightsFs() {
     const uint32_t actL = b.varF(1.0f);
     const uint32_t actR = b.varF(1.0f);
 
-    b.forLoop(0, 8, [&](uint32_t sInt) {
+    b.forLoop(0, 12, [&](uint32_t sInt) {
         const uint32_t sf = b.id();
         b.fnBody.op(111, {b.tF32, sf, sInt});
         const uint32_t stepPix = b.add(b.tF32, b.mul(b.tF32, sf, b.fcConst(2.0f)), b.fcConst(1.5f));
@@ -782,13 +785,13 @@ std::vector<uint32_t> BuildSmaaWeightsFs() {
         const uint32_t sL = b.extr(b.sample2D(0, uvL), 0);
         const uint32_t curActL = b.loadF(actL);
         b.storeF(dL, b.add(b.tF32, b.loadF(dL), b.mul(b.tF32, b.mul(b.tF32, curActL, sL), b.fcConst(2.0f))));
-        b.storeF(actL, b.mul(b.tF32, curActL, b.step(b.tF32, b.fcConst(0.95f), sL)));
+        b.storeF(actL, b.mul(b.tF32, curActL, b.step(b.tF32, b.fcConst(0.25f), sL)));
 
         const uint32_t uvR = b.add(b.tVec2, b.uv, b.v2(b.mul(b.tF32, stepPix, invW), b.fcConst(0.0f)));
         const uint32_t sR = b.extr(b.sample2D(0, uvR), 0);
         const uint32_t curActR = b.loadF(actR);
         b.storeF(dR, b.add(b.tF32, b.loadF(dR), b.mul(b.tF32, b.mul(b.tF32, curActR, sR), b.fcConst(2.0f))));
-        b.storeF(actR, b.mul(b.tF32, curActR, b.step(b.tF32, b.fcConst(0.95f), sR)));
+        b.storeF(actR, b.mul(b.tF32, curActR, b.step(b.tF32, b.fcConst(0.25f), sR)));
     });
 
     const uint32_t hSpan = b.fmax(b.tF32, b.add(b.tF32, b.loadF(dL), b.loadF(dR)), b.fcConst(1.0f));
@@ -798,23 +801,31 @@ std::vector<uint32_t> BuildSmaaWeightsFs() {
 
     const uint32_t uvEndL = b.sub(b.tVec2, b.uv, b.v2(b.mul(b.tF32, b.loadF(dL), invW), b.fcConst(0.0f)));
     const uint32_t uvEndR = b.add(b.tVec2, b.uv, b.v2(b.mul(b.tF32, b.loadF(dR), invW), b.fcConst(0.0f)));
-    const uint32_t cLT = b.extr(b.sample2D(0, b.sub(b.tVec2, uvEndL, b.v2(b.fcConst(0.0f), b.mul(b.tF32, invH, b.fcConst(0.5f))))), 1);
-    const uint32_t cLB = b.extr(b.sample2D(0, b.add(b.tVec2, uvEndL, b.v2(b.fcConst(0.0f), b.mul(b.tF32, invH, b.fcConst(0.5f))))), 1);
-    const uint32_t cRT = b.extr(b.sample2D(0, b.sub(b.tVec2, uvEndR, b.v2(b.fcConst(0.0f), b.mul(b.tF32, invH, b.fcConst(0.5f))))), 1);
-    const uint32_t cRB = b.extr(b.sample2D(0, b.add(b.tVec2, uvEndR, b.v2(b.fcConst(0.0f), b.mul(b.tF32, invH, b.fcConst(0.5f))))), 1);
+    const uint32_t cLT = b.fmax(b.tF32,
+                                b.extr(b.sample2D(0, b.sub(b.tVec2, uvEndL, b.v2(b.fcConst(0.0f), b.mul(b.tF32, invH, b.fcConst(0.5f))))), 1),
+                                b.extr(b.sample2D(0, b.sub(b.tVec2, uvEndL, b.v2(invW, b.mul(b.tF32, invH, b.fcConst(0.5f))))), 1));
+    const uint32_t cLB = b.fmax(b.tF32,
+                                b.extr(b.sample2D(0, b.add(b.tVec2, uvEndL, b.v2(b.fcConst(0.0f), b.mul(b.tF32, invH, b.fcConst(0.5f))))), 1),
+                                b.extr(b.sample2D(0, b.add(b.tVec2, uvEndL, b.v2(b.neg(b.tF32, invW), b.mul(b.tF32, invH, b.fcConst(0.5f))))), 1));
+    const uint32_t cRT = b.fmax(b.tF32,
+                                b.extr(b.sample2D(0, b.sub(b.tVec2, uvEndR, b.v2(b.fcConst(0.0f), b.mul(b.tF32, invH, b.fcConst(0.5f))))), 1),
+                                b.extr(b.sample2D(0, b.sub(b.tVec2, uvEndR, b.v2(b.neg(b.tF32, invW), b.mul(b.tF32, invH, b.fcConst(0.5f))))), 1));
+    const uint32_t cRB = b.fmax(b.tF32,
+                                b.extr(b.sample2D(0, b.add(b.tVec2, uvEndR, b.v2(b.fcConst(0.0f), b.mul(b.tF32, invH, b.fcConst(0.5f))))), 1),
+                                b.extr(b.sample2D(0, b.add(b.tVec2, uvEndR, b.v2(invW, b.mul(b.tF32, invH, b.fcConst(0.5f))))), 1));
 
     const uint32_t hNearL = b.step(b.tF32, b.loadF(dL), b.loadF(dR));
-    const uint32_t hCrossT = b.mix(b.tF32, cRT, cLT, hNearL);
-    const uint32_t hCrossB = b.mix(b.tF32, cRB, cLB, hNearL);
-    const uint32_t wTop = b.mul(b.tF32, b.mul(b.tF32, hCov, eH), b.sat(b.tF32, hCrossT));
-    const uint32_t wBot = b.mul(b.tF32, b.mul(b.tF32, hCov, eH), b.sat(b.tF32, hCrossB));
+    const uint32_t hCrossT = b.fmax(b.tF32, b.sat(b.tF32, b.mix(b.tF32, cRT, cLT, hNearL)), b.fcConst(0.22f));
+    const uint32_t hCrossB = b.fmax(b.tF32, b.sat(b.tF32, b.mix(b.tF32, cRB, cLB, hNearL)), b.fcConst(0.22f));
+    const uint32_t wTop = b.mul(b.tF32, b.mul(b.tF32, hCov, eH), hCrossT);
+    const uint32_t wBot = b.mul(b.tF32, b.mul(b.tF32, hCov, eH), hCrossB);
 
     const uint32_t dU = b.varF(0.0f);
     const uint32_t dD = b.varF(0.0f);
     const uint32_t actU = b.varF(1.0f);
     const uint32_t actD = b.varF(1.0f);
 
-    b.forLoop(0, 8, [&](uint32_t sInt) {
+    b.forLoop(0, 12, [&](uint32_t sInt) {
         const uint32_t sf = b.id();
         b.fnBody.op(111, {b.tF32, sf, sInt});
         const uint32_t stepPix = b.add(b.tF32, b.mul(b.tF32, sf, b.fcConst(2.0f)), b.fcConst(1.5f));
@@ -823,13 +834,13 @@ std::vector<uint32_t> BuildSmaaWeightsFs() {
         const uint32_t sU = b.extr(b.sample2D(0, uvU), 1);
         const uint32_t curActU = b.loadF(actU);
         b.storeF(dU, b.add(b.tF32, b.loadF(dU), b.mul(b.tF32, b.mul(b.tF32, curActU, sU), b.fcConst(2.0f))));
-        b.storeF(actU, b.mul(b.tF32, curActU, b.step(b.tF32, b.fcConst(0.95f), sU)));
+        b.storeF(actU, b.mul(b.tF32, curActU, b.step(b.tF32, b.fcConst(0.25f), sU)));
 
         const uint32_t uvD = b.add(b.tVec2, b.uv, b.v2(b.fcConst(0.0f), b.mul(b.tF32, stepPix, invH)));
         const uint32_t sD = b.extr(b.sample2D(0, uvD), 1);
         const uint32_t curActD = b.loadF(actD);
         b.storeF(dD, b.add(b.tF32, b.loadF(dD), b.mul(b.tF32, b.mul(b.tF32, curActD, sD), b.fcConst(2.0f))));
-        b.storeF(actD, b.mul(b.tF32, curActD, b.step(b.tF32, b.fcConst(0.95f), sD)));
+        b.storeF(actD, b.mul(b.tF32, curActD, b.step(b.tF32, b.fcConst(0.25f), sD)));
     });
 
     const uint32_t vSpan = b.fmax(b.tF32, b.add(b.tF32, b.loadF(dU), b.loadF(dD)), b.fcConst(1.0f));
@@ -839,16 +850,24 @@ std::vector<uint32_t> BuildSmaaWeightsFs() {
 
     const uint32_t uvEndU = b.sub(b.tVec2, b.uv, b.v2(b.fcConst(0.0f), b.mul(b.tF32, b.loadF(dU), invH)));
     const uint32_t uvEndD = b.add(b.tVec2, b.uv, b.v2(b.fcConst(0.0f), b.mul(b.tF32, b.loadF(dD), invH)));
-    const uint32_t cUL = b.extr(b.sample2D(0, b.sub(b.tVec2, uvEndU, b.v2(b.mul(b.tF32, invW, b.fcConst(0.5f)), b.fcConst(0.0f)))), 0);
-    const uint32_t cUR = b.extr(b.sample2D(0, b.add(b.tVec2, uvEndU, b.v2(b.mul(b.tF32, invW, b.fcConst(0.5f)), b.fcConst(0.0f)))), 0);
-    const uint32_t cDL = b.extr(b.sample2D(0, b.sub(b.tVec2, uvEndD, b.v2(b.mul(b.tF32, invW, b.fcConst(0.5f)), b.fcConst(0.0f)))), 0);
-    const uint32_t cDR = b.extr(b.sample2D(0, b.add(b.tVec2, uvEndD, b.v2(b.mul(b.tF32, invW, b.fcConst(0.5f)), b.fcConst(0.0f)))), 0);
+    const uint32_t cUL = b.fmax(b.tF32,
+                                b.extr(b.sample2D(0, b.sub(b.tVec2, uvEndU, b.v2(b.mul(b.tF32, invW, b.fcConst(0.5f)), b.fcConst(0.0f)))), 0),
+                                b.extr(b.sample2D(0, b.sub(b.tVec2, uvEndU, b.v2(b.mul(b.tF32, invW, b.fcConst(0.5f)), invH))), 0));
+    const uint32_t cUR = b.fmax(b.tF32,
+                                b.extr(b.sample2D(0, b.add(b.tVec2, uvEndU, b.v2(b.mul(b.tF32, invW, b.fcConst(0.5f)), b.fcConst(0.0f)))), 0),
+                                b.extr(b.sample2D(0, b.add(b.tVec2, uvEndU, b.v2(b.mul(b.tF32, invW, b.fcConst(0.5f)), b.neg(b.tF32, invH)))), 0));
+    const uint32_t cDL = b.fmax(b.tF32,
+                                b.extr(b.sample2D(0, b.sub(b.tVec2, uvEndD, b.v2(b.mul(b.tF32, invW, b.fcConst(0.5f)), b.fcConst(0.0f)))), 0),
+                                b.extr(b.sample2D(0, b.sub(b.tVec2, uvEndD, b.v2(b.mul(b.tF32, invW, b.fcConst(0.5f)), b.neg(b.tF32, invH)))), 0));
+    const uint32_t cDR = b.fmax(b.tF32,
+                                b.extr(b.sample2D(0, b.add(b.tVec2, uvEndD, b.v2(b.mul(b.tF32, invW, b.fcConst(0.5f)), b.fcConst(0.0f)))), 0),
+                                b.extr(b.sample2D(0, b.add(b.tVec2, uvEndD, b.v2(b.mul(b.tF32, invW, b.fcConst(0.5f)), invH))), 0));
 
     const uint32_t vNearU = b.step(b.tF32, b.loadF(dU), b.loadF(dD));
-    const uint32_t vCrossL = b.mix(b.tF32, cDL, cUL, vNearU);
-    const uint32_t vCrossR = b.mix(b.tF32, cDR, cUR, vNearU);
-    const uint32_t wLeft = b.mul(b.tF32, b.mul(b.tF32, vCov, eV), b.sat(b.tF32, vCrossL));
-    const uint32_t wRight = b.mul(b.tF32, b.mul(b.tF32, vCov, eV), b.sat(b.tF32, vCrossR));
+    const uint32_t vCrossL = b.fmax(b.tF32, b.sat(b.tF32, b.mix(b.tF32, cDL, cUL, vNearU)), b.fcConst(0.22f));
+    const uint32_t vCrossR = b.fmax(b.tF32, b.sat(b.tF32, b.mix(b.tF32, cDR, cUR, vNearU)), b.fcConst(0.22f));
+    const uint32_t wLeft = b.mul(b.tF32, b.mul(b.tF32, vCov, eV), vCrossL);
+    const uint32_t wRight = b.mul(b.tF32, b.mul(b.tF32, vCov, eV), vCrossR);
 
     return b.finish(b.v4(wTop, wBot, wLeft, wRight));
 }
@@ -886,8 +905,134 @@ std::vector<uint32_t> BuildSmaaBlendAndAcesFs() {
     const uint32_t vT = b.div(b.tF32, aRight, b.fmax(b.tF32, b.add(b.tF32, aLeft, aRight), b.fcConst(1e-5f)));
     const uint32_t vBlend = b.mix(b.tVec3, colL, colR, b.splat3(vT));
 
-    const uint32_t aaRaw = b.mix(b.tVec3, vBlend, hBlend, b.splat3(useH));
-    const uint32_t aaCol = b.mix(b.tVec3, b.xyz(c0), aaRaw, b.splat3(hasAny));
+    const uint32_t smaaRaw = b.mix(b.tVec3, vBlend, hBlend, b.splat3(useH));
+    const uint32_t smaaCol = b.mix(b.tVec3, b.xyz(c0), smaaRaw, b.splat3(hasAny));
+
+    const uint32_t lumaW = b.v3f(0.299f, 0.587f, 0.114f);
+    auto lumaAtUV = [&](uint32_t tc) {
+        return b.dot(b.xyz(b.sample2D(0, tc)), lumaW);
+    };
+    auto lumaOff = [&](uint32_t dx, uint32_t dy) {
+        return lumaAtUV(b.add(b.tVec2, b.uv, b.v2(dx, dy)));
+    };
+
+    const uint32_t negW = b.neg(b.tF32, invW);
+    const uint32_t negH = b.neg(b.tF32, invH);
+    const uint32_t zero = b.fcConst(0.0f);
+
+    const uint32_t lM = b.dot(b.xyz(c0), lumaW);
+    const uint32_t lN = lumaOff(zero, negH);
+    const uint32_t lS = lumaOff(zero, invH);
+    const uint32_t lW = lumaOff(negW, zero);
+    const uint32_t lE = lumaOff(invW, zero);
+    const uint32_t lNW = lumaOff(negW, negH);
+    const uint32_t lNE = lumaOff(invW, negH);
+    const uint32_t lSW = lumaOff(negW, invH);
+    const uint32_t lSE = lumaOff(invW, invH);
+
+    const uint32_t lMin = b.fmin(b.tF32, lM, b.fmin(b.tF32, b.fmin(b.tF32, lN, lS), b.fmin(b.tF32, lW, lE)));
+    const uint32_t lMax = b.fmax(b.tF32, lM, b.fmax(b.tF32, b.fmax(b.tF32, lN, lS), b.fmax(b.tF32, lW, lE)));
+    const uint32_t lRange = b.sub(b.tF32, lMax, lMin);
+    const uint32_t edgeMinThresh = b.fmax(b.tF32, b.fcConst(0.0312f), b.mul(b.tF32, lMax, b.fcConst(0.10f)));
+    const uint32_t edgeActive = b.step(b.tF32, edgeMinThresh, lRange);
+
+    const uint32_t lNS = b.add(b.tF32, lN, lS);
+    const uint32_t lWE = b.add(b.tF32, lW, lE);
+    const uint32_t lNWSW = b.add(b.tF32, lNW, lSW);
+    const uint32_t lNESE = b.add(b.tF32, lNE, lSE);
+    const uint32_t lNWNE = b.add(b.tF32, lNW, lNE);
+    const uint32_t lSWSE = b.add(b.tF32, lSW, lSE);
+
+    const uint32_t subpixLuma = b.mul(b.tF32,
+                                      b.add(b.tF32, b.mul(b.tF32, b.add(b.tF32, lNS, lWE), b.fcConst(2.0f)),
+                                            b.add(b.tF32, lNWSW, lNESE)),
+                                      b.fcConst(1.0f / 12.0f));
+    const uint32_t subpixB = b.sat(b.tF32, b.div(b.tF32, b.fabs(b.tF32, b.sub(b.tF32, subpixLuma, lM)),
+                                                 b.fmax(b.tF32, lRange, b.fcConst(1e-5f))));
+    const uint32_t subpixC = b.mul(b.tF32, b.mul(b.tF32, subpixB, subpixB),
+                                   b.sub(b.tF32, b.fcConst(3.0f), b.mul(b.tF32, b.fcConst(2.0f), subpixB)));
+    const uint32_t subpixFactor = b.mul(b.tF32, b.mul(b.tF32, subpixC, subpixC), b.fcConst(0.68f));
+
+    const uint32_t edgeH1 = b.fabs(b.tF32, b.sub(b.tF32, lNWSW, b.mul(b.tF32, b.fcConst(2.0f), lW)));
+    const uint32_t edgeH2 = b.mul(b.tF32, b.fcConst(2.0f), b.fabs(b.tF32, b.sub(b.tF32, lNS, b.mul(b.tF32, b.fcConst(2.0f), lM))));
+    const uint32_t edgeH3 = b.fabs(b.tF32, b.sub(b.tF32, lNESE, b.mul(b.tF32, b.fcConst(2.0f), lE)));
+    const uint32_t fxEdgeHorz = b.add(b.tF32, b.add(b.tF32, edgeH1, edgeH2), edgeH3);
+
+    const uint32_t edgeV1 = b.fabs(b.tF32, b.sub(b.tF32, lNWNE, b.mul(b.tF32, b.fcConst(2.0f), lN)));
+    const uint32_t edgeV2 = b.mul(b.tF32, b.fcConst(2.0f), b.fabs(b.tF32, b.sub(b.tF32, lWE, b.mul(b.tF32, b.fcConst(2.0f), lM))));
+    const uint32_t edgeV3 = b.fabs(b.tF32, b.sub(b.tF32, lSWSE, b.mul(b.tF32, b.fcConst(2.0f), lS)));
+    const uint32_t fxEdgeVert = b.add(b.tF32, b.add(b.tF32, edgeV1, edgeV2), edgeV3);
+
+    const uint32_t isHorz = b.step(b.tF32, fxEdgeVert, fxEdgeHorz);
+    const uint32_t luma1 = b.mix(b.tF32, lW, lN, isHorz);
+    const uint32_t luma2 = b.mix(b.tF32, lE, lS, isHorz);
+    const uint32_t grad1 = b.fabs(b.tF32, b.sub(b.tF32, luma1, lM));
+    const uint32_t grad2 = b.fabs(b.tF32, b.sub(b.tF32, luma2, lM));
+    const uint32_t is1Steep = b.step(b.tF32, grad2, grad1);
+    const uint32_t gradScaled = b.mul(b.tF32, b.fcConst(0.25f), b.fmax(b.tF32, grad1, grad2));
+
+    const uint32_t stepMag = b.mix(b.tF32, invW, invH, isHorz);
+    const uint32_t signedStep = b.mix(b.tF32, stepMag, b.neg(b.tF32, stepMag), is1Steep);
+    const uint32_t lumaLocalAvg = b.mul(b.tF32, b.fcConst(0.5f),
+                                        b.add(b.tF32, b.mix(b.tF32, luma2, luma1, is1Steep), lM));
+
+    const uint32_t halfStep = b.mul(b.tF32, signedStep, b.fcConst(0.5f));
+    const uint32_t posB = b.add(b.tVec2, b.uv,
+                                b.v2(b.mix(b.tF32, halfStep, zero, isHorz),
+                                     b.mix(b.tF32, zero, halfStep, isHorz)));
+    const uint32_t tangStep = b.v2(b.mix(b.tF32, zero, invW, isHorz),
+                                   b.mix(b.tF32, invH, zero, isHorz));
+
+    const uint32_t distN = b.varF(0.0f);
+    const uint32_t distP = b.varF(0.0f);
+    const uint32_t actN = b.varF(1.0f);
+    const uint32_t actP = b.varF(1.0f);
+    const uint32_t endSignN = b.varF(0.0f);
+    const uint32_t endSignP = b.varF(0.0f);
+
+    b.forLoop(0, 10, [&](uint32_t sInt) {
+        const uint32_t sf = b.id();
+        b.fnBody.op(111, {b.tF32, sf, sInt});
+        const uint32_t stepPix = b.add(b.tF32, b.fcConst(1.0f),
+                                       b.mul(b.tF32, b.floor(b.tF32, b.mul(b.tF32, sf, b.fcConst(0.5f))), b.fcConst(0.5f)));
+
+        const uint32_t cActN = b.loadF(actN);
+        const uint32_t tryDistN = b.add(b.tF32, b.loadF(distN), stepPix);
+        const uint32_t uvN = b.sub(b.tVec2, posB, b.vscale(b.tVec2, tangStep, tryDistN));
+        const uint32_t lEndN = b.sub(b.tF32, lumaAtUV(uvN), lumaLocalAvg);
+        const uint32_t hitN = b.step(b.tF32, gradScaled, b.fabs(b.tF32, lEndN));
+        b.storeF(distN, b.mix(b.tF32, b.loadF(distN), tryDistN, cActN));
+        b.storeF(endSignN, b.mix(b.tF32, b.loadF(endSignN), b.step(b.tF32, zero, lEndN), cActN));
+        b.storeF(actN, b.mul(b.tF32, cActN, b.sub(b.tF32, b.fcConst(1.0f), hitN)));
+
+        const uint32_t cActP = b.loadF(actP);
+        const uint32_t tryDistP = b.add(b.tF32, b.loadF(distP), stepPix);
+        const uint32_t uvP = b.add(b.tVec2, posB, b.vscale(b.tVec2, tangStep, tryDistP));
+        const uint32_t lEndP = b.sub(b.tF32, lumaAtUV(uvP), lumaLocalAvg);
+        const uint32_t hitP = b.step(b.tF32, gradScaled, b.fabs(b.tF32, lEndP));
+        b.storeF(distP, b.mix(b.tF32, b.loadF(distP), tryDistP, cActP));
+        b.storeF(endSignP, b.mix(b.tF32, b.loadF(endSignP), b.step(b.tF32, zero, lEndP), cActP));
+        b.storeF(actP, b.mul(b.tF32, cActP, b.sub(b.tF32, b.fcConst(1.0f), hitP)));
+    });
+
+    const uint32_t dN = b.loadF(distN);
+    const uint32_t dP = b.loadF(distP);
+    const uint32_t isDirN = b.step(b.tF32, dN, dP);
+    const uint32_t dstMin = b.fmin(b.tF32, dN, dP);
+    const uint32_t closerSign = b.mix(b.tF32, b.loadF(endSignP), b.loadF(endSignN), isDirN);
+    const uint32_t lMSign = b.step(b.tF32, zero, b.sub(b.tF32, lM, lumaLocalAvg));
+    const uint32_t goodSpan = b.fabs(b.tF32, b.sub(b.tF32, closerSign, lMSign));
+    const uint32_t spanLen = b.fmax(b.tF32, b.add(b.tF32, dN, dP), b.fcConst(1e-4f));
+    const uint32_t edgeOff = b.mul(b.tF32, goodSpan,
+                                   b.fmax(b.tF32, zero, b.sub(b.tF32, b.fcConst(0.5f), b.div(b.tF32, dstMin, spanLen))));
+    const uint32_t finalOff = b.mul(b.tF32, b.fmax(b.tF32, edgeOff, subpixFactor), edgeActive);
+
+    const uint32_t fxShift = b.mul(b.tF32, finalOff, signedStep);
+    const uint32_t uvFX = b.add(b.tVec2, b.uv,
+                                b.v2(b.mix(b.tF32, fxShift, zero, isHorz),
+                                     b.mix(b.tF32, zero, fxShift, isHorz)));
+    const uint32_t fxaaCol = b.xyz(b.sample2D(0, uvFX));
+    const uint32_t aaCol = b.mix(b.tVec3, fxaaCol, smaaCol, b.splat3(b.mul(b.tF32, hasAny, b.fcConst(0.30f))));
 
     const uint32_t safeAA = b.fmax(b.tVec3, aaCol, b.v3f(1e-4f, 1e-4f, 1e-4f));
     const uint32_t lin = b.pow(b.tVec3, safeAA, b.v3f(2.2f, 2.2f, 2.2f));
@@ -1124,8 +1269,8 @@ void PostFx::TrackDraw(FakeSurface* color0, FakeSurface* color1,
     if (!initialized_) return;
     const VkExtent2D sw = g_backend.SwapchainExtent();
     if (!sw.width || !sw.height) return;
-    const uint32_t minW = (sw.width * 3u) / 4u;
-    const uint32_t minH = (sw.height * 3u) / 4u;
+    const uint32_t minW = sw.width / 2u;
+    const uint32_t minH = sw.height / 2u;
 
     if (!color0 || color0->isBackbuffer) {
         ++bbDraws_;
@@ -1143,8 +1288,8 @@ void PostFx::TrackDraw(FakeSurface* color0, FakeSurface* color1,
     }
 
     if (depth && !depth->isBackbuffer && depth->width >= minW &&
-        depth->height >= minH && color0->width == depth->width &&
-        color0->height == depth->height) {
+        depth->height >= minH && depth->height <= sw.height * 2u &&
+        color0->width == depth->width && color0->height == depth->height) {
         if (color1 != nullptr) {
             gbufSeen_ = true;
             gbufDepth_ = depth;
@@ -1222,50 +1367,76 @@ void PostFx::DestroyTarget(RenderTarget& rt) {
     rt = RenderTarget{};
 }
 
-void PostFx::DestroyTargets() {
+void PostFx::DestroySceneTargets() {
     DestroyTarget(gtaoRaw_);
     DestroyTarget(gtaoTmp_);
     DestroyTarget(gtaoFinal_);
     DestroyTarget(sceneCopy_);
+    allocSceneW_ = 0;
+    allocSceneH_ = 0;
+    allocSceneFmt_ = VK_FORMAT_UNDEFINED;
+}
+
+void PostFx::DestroyBbTargets() {
     DestroyTarget(bbCopy_);
     DestroyTarget(smaaEdges_);
     DestroyTarget(smaaWeights_);
-    allocW_ = 0;
-    allocH_ = 0;
-    allocSceneFmt_ = VK_FORMAT_UNDEFINED;
+    allocBbW_ = 0;
+    allocBbH_ = 0;
     allocBbFmt_ = VK_FORMAT_UNDEFINED;
 }
 
-bool PostFx::EnsureTargets(uint32_t fullW, uint32_t fullH, VkFormat sceneFmt,
-                           VkFormat bbFmt) {
-    if (!fullW || !fullH) return false;
-    const uint32_t hw = (fullW + 1u) / 2u;
-    const uint32_t hh = (fullH + 1u) / 2u;
+void PostFx::DestroyTargets() {
+    DestroySceneTargets();
+    DestroyBbTargets();
+}
 
-    if (allocW_ == fullW && allocH_ == fullH && allocSceneFmt_ == sceneFmt &&
-        allocBbFmt_ == bbFmt && gtaoRaw_.view && gtaoTmp_.view &&
-        gtaoFinal_.view && sceneCopy_.view && bbCopy_.view && smaaEdges_.view &&
-        smaaWeights_.view) {
+bool PostFx::EnsureSceneTargets(uint32_t sceneW, uint32_t sceneH,
+                                VkFormat sceneFmt) {
+    if (!sceneW || !sceneH) return false;
+    const uint32_t hw = (sceneW + 1u) / 2u;
+    const uint32_t hh = (sceneH + 1u) / 2u;
+
+    if (allocSceneW_ == sceneW && allocSceneH_ == sceneH &&
+        allocSceneFmt_ == sceneFmt && gtaoRaw_.view && gtaoTmp_.view &&
+        gtaoFinal_.view && sceneCopy_.view) {
         return true;
     }
 
-    DestroyTargets();
+    DestroySceneTargets();
     if (!CreateTarget(gtaoRaw_, hw, hh, VK_FORMAT_R8_UNORM) ||
         !CreateTarget(gtaoTmp_, hw, hh, VK_FORMAT_R8_UNORM) ||
         !CreateTarget(gtaoFinal_, hw, hh, VK_FORMAT_R8_UNORM) ||
-        !CreateTarget(sceneCopy_, fullW, fullH, sceneFmt,
-                      VK_IMAGE_USAGE_TRANSFER_DST_BIT) ||
-        !CreateTarget(bbCopy_, fullW, fullH, bbFmt,
-                      VK_IMAGE_USAGE_TRANSFER_DST_BIT) ||
-        !CreateTarget(smaaEdges_, fullW, fullH, VK_FORMAT_R8G8_UNORM) ||
-        !CreateTarget(smaaWeights_, fullW, fullH, VK_FORMAT_R8G8B8A8_UNORM)) {
-        DestroyTargets();
+        !CreateTarget(sceneCopy_, sceneW, sceneH, sceneFmt,
+                      VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        DestroySceneTargets();
         return false;
     }
 
-    allocW_ = fullW;
-    allocH_ = fullH;
+    allocSceneW_ = sceneW;
+    allocSceneH_ = sceneH;
     allocSceneFmt_ = sceneFmt;
+    return true;
+}
+
+bool PostFx::EnsureBbTargets(uint32_t bbW, uint32_t bbH, VkFormat bbFmt) {
+    if (!bbW || !bbH) return false;
+    if (allocBbW_ == bbW && allocBbH_ == bbH && allocBbFmt_ == bbFmt &&
+        bbCopy_.view && smaaEdges_.view && smaaWeights_.view) {
+        return true;
+    }
+
+    DestroyBbTargets();
+    if (!CreateTarget(bbCopy_, bbW, bbH, bbFmt,
+                      VK_IMAGE_USAGE_TRANSFER_DST_BIT) ||
+        !CreateTarget(smaaEdges_, bbW, bbH, VK_FORMAT_R8G8_UNORM) ||
+        !CreateTarget(smaaWeights_, bbW, bbH, VK_FORMAT_R8G8B8A8_UNORM)) {
+        DestroyBbTargets();
+        return false;
+    }
+
+    allocBbW_ = bbW;
+    allocBbH_ = bbH;
     allocBbFmt_ = bbFmt;
     return true;
 }
@@ -1430,7 +1601,7 @@ bool PostFx::FlushScenePass(FakeSurface* colorOverride,
     }
 
     if (!scImg || !scView || !sdImg || !sdView || !fullW || !fullH) return false;
-    if (!EnsureTargets(fullW, fullH, scFmt, g_backend.SwapchainColorFormat()))
+    if (!EnsureSceneTargets(fullW, fullH, scFmt))
         return false;
 
     if (!EnsureGraphicsPipeline(fsGtao_, VK_FORMAT_R8_UNORM, pipeGtao_, fmtGtao_) ||
@@ -1561,10 +1732,7 @@ bool PostFx::FlushBeforeHud() {
         return false;
     }
 
-    if (!EnsureTargets(sw.width, sw.height, allocSceneFmt_ != VK_FORMAT_UNDEFINED
-                                                 ? allocSceneFmt_
-                                                 : bbFmt,
-                       bbFmt)) {
+    if (!EnsureBbTargets(sw.width, sw.height, bbFmt)) {
         return false;
     }
 
