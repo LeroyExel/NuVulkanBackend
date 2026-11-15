@@ -1,95 +1,74 @@
 # NuVulkanBackend
 
-A native Vulkan 1.3 replacement for the Direct3D 9 device inside
-*The LEGO Movie - Videogame* (`LEGOEMMET.exe`, Traveller's Tales NuEngine).
-No DXVK, no WineD3D, no Gallium Nine — the D3D9 device is never created against
-the driver at all.
+A native **Vulkan 1.3** drop-in `d3d9.dll` replacement for the Direct3D 9 renderer in *The LEGO Movie - Videogame* (`LEGOEMMET.exe`, Traveller's Tales NuEngine). No DXVK, WineD3D, or Gallium Nine — all D3D9 calls are translated directly to Vulkan 1.3 dynamic rendering.
 
-## How the interception works
+![NuVulkanBackend In-Game Screenshot](docs/screenshot.png)
 
-`Direct3D9` is statically imported by the executable, and the import table has
-exactly one D3D9 entry point (`Direct3DCreate9`, IAT RVA `0x00C49360`). The DLL:
+## Features
 
-1. patches that IAT slot to `Hook_Direct3DCreate9`;
-2. returns a fake `IDirect3D9` whose `CreateDevice` (byte offset 64, verified)
-   initialises Vulkan on the `hFocusWindow` the engine passes in;
-3. returns a fake `IDirect3DDevice9` whose vtable the DLL owns, so **every**
-   D3D9 call the engine makes lands in this code. The engine's renderer
-   singleton (`0x01980F78`, `docs/stage1_recon.md`) stores our pointer at
-   `+0x004` and never notices.
+- **Native D3D9-to-Vulkan 1.3 Translation**
+  - Direct `IDirect3D9` / `IDirect3DDevice9` vtable implementation verified at compile time against the executable's observed vtable offsets (`src/d3d9_vtable.h`, `tools/gen_d3d9_slots.py`).
+  - On-the-fly Shader Model 3.0 (`vs_3_0` / `ps_3_0`) to **SPIR-V 1.3** compiler (`src/sm3_to_spirv.cpp`) with persistent on-disk shader caching (`src/shaders.cpp`).
+  - Lock-free 257-register uniform buffer ring (`src/constants.cpp`), XXH64 graphics PSO cache (`src/pso_cache.cpp`), dual-frame-in-flight command recording, and Vulkan Memory Allocator (`VMA`) resource management (`src/resources.cpp`).
+  - Automatic NaN/Inf sanitization on vertex shader outputs to prevent geometry explosions.
 
-Because the vtable is ours, coverage is exact by construction — no call-site
-scanning, no function detours that can miss an inlined path.
+- **Ground-Truth Ambient Occlusion (GTAO)**
+  - Half-resolution 6-slice horizon-based ambient occlusion with interleaved gradient noise (`src/post_fx.cpp`).
+  - Separable 7-tap depth-aware bilateral blur for clean contact shadows between studs, bricks, minifigures, and street corners without halo artifacts.
 
-## Vtable safety
+- **ABS Plastic Micro-Roughness & Lighting Enhancement**
+  - 3D shader post-hook in `src/sm3_to_spirv.cpp` and screen-space normal/ViewDir shading in `src/post_fx.cpp` adding Schlick Fresnel rim highlights, ABS plastic specular catchlights, subtle micro-grain roughness variation, and cool bounce lighting.
 
-Slot indices and argument counts are **generated** from the Windows SDK
-`d3d9.h` by `tools/gen_d3d9_slots.py` into `src/d3d9_slots.h`.
+- **Hybrid SMAA + FXAA 3.11 Edge Anti-Aliasing**
+  - Multi-pass perceptual luminance edge detection (`BuildSmaaEdgesFs`), 12-step morphological span weighting (`BuildSmaaWeightsFs`), and 3x3 gradient-directed FXAA edge-tangent search + subpixel smoothing (`BuildSmaaBlendAndAcesFs`).
+  - Executed via scene/HUD boundary detection (`FlushBeforeHud`) so 3D edges are smoothed while 2D HUD, portraits, and text remain crisp at native resolution.
 
-This is not ceremony. Hand-transcribing the table produced `DrawIndexedPrimitive
-= 62`; the real slot is **82**. A wrong index with a wrong arity corrupts the
-stack on the first draw. `src/d3d9_vtable.h` `static_assert`s the four offsets
-observed inside the binary (`+12`, `+20`, `+28`, `+64`) against the generated
-table, so a drift in either direction fails the build instead of the game.
+- **ACES Filmic Tone Mapping, Haze & Sun Shafts**
+  - ACES filmic tone curve with shadow-weighted vibrance and S-curve grading.
+  - Depth-masked atmospheric distance haze and radial sun shafts in 3D outdoor scenes.
+
+- **16x Anisotropic Filtering & World Sampler Sharpening**
+  - Upgrades 3D world samplers to `16x` anisotropic filtering with `-0.5` mip LOD bias (`src/d3d9_draw.cpp`).
+
+- **Stud Contact Shadows & In-Game FPS Counter**
+  - Depth-sampled contact shadows under collectible studs (`src/stud_shadows.cpp`) and an integrated corner FPS overlay (`src/fps_overlay.cpp`).
 
 ## Subsystems
 
 | File | Responsibility |
 |---|---|
-| `src/dllmain.cpp` | IAT hook, log, `Direct3DCreate9` proxy exports |
-| `src/d3d9_factory.cpp` | fake `IDirect3D9`, device creation, swap chain/query objects |
-| `src/d3d9_device.cpp` | `IDirect3DDevice9` vtable, state, constants, resources, state blocks |
-| `src/d3d9_draw.cpp` | pipeline key, draw translation, render-target selection |
-| `src/d3d9_internal.h` | shared device state and internal declarations |
-| `src/vk_context.cpp` | instance, device, Win32 surface, swapchain, 2 frames in flight, dynamic rendering |
-| `src/constants.cpp` | 257-register VS/PS blocks in a persistently mapped dynamic uniform ring |
-| `src/resources.cpp` | engine handle → `VkBuffer`/`VkImage`/`VmaAllocation`, COM vtables, lock/unlock upload |
-| `src/shaders.cpp` | XXH64 capture and `.sm3` dump of every engine shader, `.spv` cache |
-| `src/sm3_to_spirv.cpp` | SM3 token stream → SPIR-V 1.3 |
-| `src/pso_cache.cpp` | XXH64 state hash → `VkPipeline` via dynamic rendering |
+| `src/dllmain.cpp` | IAT hook, logger (`d3d9.log`), `Direct3DCreate9` proxy exports |
+| `src/d3d9_factory.cpp` | Fake `IDirect3D9`, device creation, swapchain and query objects |
+| `src/d3d9_device.cpp` | `IDirect3DDevice9` vtable, render states, constants, state blocks |
+| `src/d3d9_draw.cpp` | Pipeline state key, draw translation, `16x` AF sampler setup, post-FX hooks |
+| `src/d3d9_internal.h` | Shared device state and internal structures |
+| `src/vk_context.cpp` | Vulkan 1.3 instance/device, swapchain, dynamic rendering, frames in flight |
+| `src/constants.cpp` | 257-register VS/PS uniform blocks in a persistently mapped dynamic ring |
+| `src/resources.cpp` | Buffer, texture, cube, volume, and surface management via VMA |
+| `src/shaders.cpp` | XXH64 shader hashing and disk SPIR-V cache |
+| `src/sm3_to_spirv.cpp` | SM3 bytecode -> SPIR-V 1.3 translator and ABS plastic shader enhancement |
+| `src/pso_cache.cpp` | XXH64 pipeline state hash -> `VkPipeline` cache |
+| `src/post_fx.cpp` | GTAO, bilateral blur, ABS specular/rim/haze, SMAA + FXAA 3.11, ACES |
+| `src/stud_shadows.cpp` | Projected depth-aware contact shadows for studs |
+| `src/fps_overlay.cpp` | Integrated bitmap-font FPS overlay |
 
-Constant registers are exact: `c0..c255` is 256 × 16 B = **4096 bytes**, plus a
-zeroed `c[256]` padding register for out-of-range relative addressing. A draw
-takes two consecutive aligned blocks with dynamic offsets `{vs, ps}`.
+## Installation
 
-## Build
+1. Download `NuVulkanBackend-v1.0.0.zip` (or `d3d9.dll`) from the [Releases](https://github.com/LeroyExel/NuVulkanBackend/releases) page.
+2. Copy `d3d9.dll` into your *The LEGO Movie - Videogame* installation folder next to `LEGOEMMET.exe`.
+3. Launch `LEGOEMMET.exe`. First launch compiles and caches SPIR-V shaders into `shaders/`.
+
+## Building from Source
+
+Requires MSVC (x86) and CMake. Vulkan headers, VMA, and xxHash are vendored under `vendor/`; `vulkan-1.dll` is loaded dynamically at runtime.
 
 ```sh
 cmake -S . -B build -A Win32
 cmake --build build --config Release
 ```
 
-Requires MSVC (x86) and CMake. Vulkan headers, VMA, MinHook and xxHash are
-vendored under `vendor/`; the DLL loads `vulkan-1.dll` dynamically and needs no
-SDK import library.
-
-## Run
+The compiled 32-bit DLL is written to `build/Release/NuVulkanBackend.dll` and can be copied next to `LEGOEMMET.exe` as `d3d9.dll`. Or inject dynamically:
 
 ```powershell
-# start the game, then:
 tools\inject.ps1 -Process LEGOEMMET
 ```
-
-`NuVulkanBackend.log` is written next to the DLL. Shader bytecode lands in
-`shaders\*.dxbc` beside the game executable.
-
-## Status
-
-Verified:
-
-* builds as 32-bit PE (x86) against Vulkan 1.3 headers;
-* generated vtable satisfies all four offsets the binary actually calls;
-* `Direct3DCreate9` IAT RVA and the renderer singleton offsets are read from
-  the database, not assumed.
-
-Implemented but **not yet exercised in-game**:
-
-* swapchain takeover, dynamic-rendering frame loop, clears, present;
-* buffer/texture upload, constant ring, PSO cache, draw translation.
-
-Not implemented:
-
-* `SetFVF` vertex-declaration synthesis (shader draws use explicit
-  declarations);
-* two-sided stencil and fixed-function clip planes;
-* SM1/SM2 token streams (the engine compiles everything to SM3).
