@@ -1,5 +1,6 @@
 #include "d3d9_internal.h"
 #include "stud_shadows.h"
+#include "post_fx.h"
 
 using namespace d3d9;
 
@@ -298,6 +299,7 @@ bool StartNewFrame() {
     g_st.targetsDirty = true;
     ResetDrawCache();
     g_studShadows.BeginFrame();
+    g_postFx.BeginFrame();
     g_frameActive = true;
     return true;
 }
@@ -306,6 +308,7 @@ uint32_t __stdcall Dev_Present(void*, const RECT*, const RECT*, const void*,
                                const void*) {
     if (g_backendReady && g_frameActive) {
         g_studShadows.FlushEndOfFrame();
+        g_postFx.FlushEndOfFrame();
         g_backend.EndFrame(true);
         g_frameActive = false;
         g_psos.FlushCache();
@@ -332,6 +335,9 @@ static uint32_t __stdcall Dev_Clear(void*, uint32_t count, const RECT* rects,
     if (!g_backendReady) return 0;
     if (!g_frameActive) g_frameActive = StartNewFrame();
     if ((flags & 2u) && g_studShadows.FlushBeforeDepthClear(g_st.depthTarget)) {
+        ResetDrawCache();
+    }
+    if ((flags & 2u) && g_postFx.FlushBeforeDepthClear(g_st.depthTarget)) {
         ResetDrawCache();
     }
     if (g_st.targetsDirty) {
@@ -817,6 +823,12 @@ static uint32_t __stdcall Dev_StretchRect(void*, FakeSurface* src,
     }
     if (g_studShadows.FlushIfReading(src)) {
         ResetDrawCache();
+    }
+    if (g_postFx.FlushIfReading(src)) {
+        ResetDrawCache();
+    }
+    if (dst && dst->isBackbuffer) {
+        g_postFx.MarkBackbufferStretch();
     }
     g_backend.BlitImage(MakeImageRef(src), srcRect, MakeImageRef(dst), dstRect);
     return 0;

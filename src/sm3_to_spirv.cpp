@@ -123,6 +123,7 @@ enum : uint32_t {
     OPC_SHIFT_RIGHT_LOGICAL = 194, OPC_SHIFT_RIGHT_ARITHMETIC = 195,
     OPC_SHIFT_LEFT_LOGICAL = 196, OPC_BITWISE_OR = 197, OPC_BITWISE_XOR = 198,
     OPC_BITWISE_AND = 199, OPC_NOT = 200,
+    OPC_DPDX = 207, OPC_DPDY = 208,
     OPC_LOOP_MERGE = 246,
     OPC_SELECTION_MERGE = 247, OPC_LABEL = 248, OPC_BRANCH = 249,
     OPC_BRANCH_CONDITIONAL = 250, OPC_KILL = 252, OPC_RETURN = 253,
@@ -136,15 +137,15 @@ enum : uint32_t { DEC_SPEC_ID = 1, DEC_BLOCK = 2, DEC_ARRAY_STRIDE = 6, DEC_BUIL
                   DEC_LOCATION = 30, DEC_BINDING = 33, DEC_DESCRIPTOR_SET = 34,
                   DEC_OFFSET = 35 };
 
-enum : uint32_t { BI_POSITION = 0, BI_FRAG_DEPTH = 7 };
+enum : uint32_t { BI_POSITION = 0, BI_FRAG_DEPTH = 7, BI_FRAG_COORD = 15 };
 
 // GLSL.std.450 numbers (these are NOT sequential by name, easy to get wrong)
 enum : uint32_t {
-    GLSL_Round = 1, GLSL_FAbs = 4, GLSL_Sign = 6, GLSL_Fract = 10, GLSL_Sin = 13,
-    GLSL_Cos = 14,
+    GLSL_Round = 1, GLSL_FAbs = 4, GLSL_Sign = 6, GLSL_Floor = 8,
+    GLSL_Fract = 10, GLSL_Sin = 13, GLSL_Cos = 14,
     GLSL_Pow = 26, GLSL_Exp2 = 29, GLSL_Log2 = 30, GLSL_InverseSqrt = 32,
-    GLSL_FMin = 37, GLSL_FMax = 40, GLSL_FClamp = 43, GLSL_Cross = 68,
-    GLSL_Normalize = 69
+    GLSL_FMin = 37, GLSL_FMax = 40, GLSL_FClamp = 43, GLSL_FMix = 46,
+    GLSL_Cross = 68, GLSL_Normalize = 69
 };
 
 // MSVC does not implement C compound literals, so the identity swizzle lives
@@ -277,6 +278,7 @@ struct Ctx {
     std::vector<uint32_t> interfaces;
     uint32_t posVar = 0;
     uint32_t realPosVar = 0;
+    uint32_t fragCoordVar = 0;
     uint32_t mainId = 0;
 
     struct Cf {
@@ -288,6 +290,8 @@ struct Ctx {
     std::vector<Cf> cf;
     uint32_t unsupported = 0;
     bool depthWarned = false;
+    bool enhanceAbs = false;
+    uint32_t aluOps = 0;
     std::vector<uint32_t> colorUsed;
 
     void fail(const std::string& why) {
@@ -1779,6 +1783,10 @@ bool Sm3CompileToSpirv(bool pixelHint, const uint32_t* tokens,
             }
             if (opcode == OP_DCL && len >= 3)
                 c.EmitDcl(tokens + i + 1, len - 1, true);
+            if (opcode != OP_DCL && opcode != OP_DEF && opcode != OP_DEFB &&
+                opcode != OP_DEFI) {
+                ++c.aluOps;
+            }
             // A FragDepth store needs OpExecutionMode DepthReplacing; without it
             // nvgpucomp reads an empty execution-mode entry and faults.
             if (opcode != OP_DCL && len >= 2) {
@@ -1795,6 +1803,15 @@ bool Sm3CompileToSpirv(bool pixelHint, const uint32_t* tokens,
         }
     }
     c.DeclarePixelOutputs();
+    c.enhanceAbs = c.pixel && c.colorUsed.size() == 1 && c.colorUsed[0] == 0 &&
+                   c.aluOps >= 32 && c.realInVars.size() >= 3 &&
+                   !c.samplerVar.empty();
+    if (c.enhanceAbs) {
+        c.fragCoordVar = c.id();
+        c.glob.op(OPC_VARIABLE, {c.ptrInV4, c.fragCoordVar, SC_INPUT});
+        c.ann.op(OPC_DECORATE, {c.fragCoordVar, DEC_BUILTIN, BI_FRAG_COORD});
+        c.interfaces.push_back(c.fragCoordVar);
+    }
 
     c.mainId = c.id();
     {
@@ -1926,6 +1943,133 @@ bool Sm3CompileToSpirv(bool pixelHint, const uint32_t* tokens,
                     c.Label(killB);
                     c.fn.op(OPC_KILL, {});
                     c.Label(mergeB);
+                }
+                if (reg == 0 && c.enhanceAbs && c.fragCoordVar) {
+                    auto fOp2 = [&](uint32_t opc, uint32_t a, uint32_t b) {
+                        uint32_t r = c.id();
+                        c.fn.op(opc, {c.tFloat, r, a, b});
+                        return r;
+                    };
+                    auto gExt1 = [&](uint32_t inst, uint32_t a) {
+                        uint32_t r = c.id();
+                        c.fn.op(OPC_EXT_INST, {c.tFloat, r, c.glsl, inst, a});
+                        return r;
+                    };
+                    auto gExt2 = [&](uint32_t inst, uint32_t a, uint32_t b) {
+                        uint32_t r = c.id();
+                        c.fn.op(OPC_EXT_INST, {c.tFloat, r, c.glsl, inst, a, b});
+                        return r;
+                    };
+                    auto gExt3 = [&](uint32_t inst, uint32_t a, uint32_t b, uint32_t k) {
+                        uint32_t r = c.id();
+                        c.fn.op(OPC_EXT_INST, {c.tFloat, r, c.glsl, inst, a, b, k});
+                        return r;
+                    };
+                    uint32_t colR = c.id();
+                    c.fn.op(OPC_COMPOSITE_EXTRACT, {c.tFloat, colR, finalVal, 0});
+                    uint32_t colG = c.id();
+                    c.fn.op(OPC_COMPOSITE_EXTRACT, {c.tFloat, colG, finalVal, 1});
+                    uint32_t colB = c.id();
+                    c.fn.op(OPC_COMPOSITE_EXTRACT, {c.tFloat, colB, finalVal, 2});
+                    uint32_t colA = c.id();
+                    c.fn.op(OPC_COMPOSITE_EXTRACT, {c.tFloat, colA, finalVal, 3});
+
+                    uint32_t fc = c.LoadVar(c.fragCoordVar, c.tVec4);
+                    uint32_t fcX = c.id();
+                    c.fn.op(OPC_COMPOSITE_EXTRACT, {c.tFloat, fcX, fc, 0});
+                    uint32_t fcY = c.id();
+                    c.fn.op(OPC_COMPOSITE_EXTRACT, {c.tFloat, fcY, fc, 1});
+
+                    uint32_t cCell = c.ConstF(0.85f);
+                    uint32_t cHashX = c.ConstF(12.9898f);
+                    uint32_t cHashY = c.ConstF(78.233f);
+                    uint32_t cHashM = c.ConstF(43758.5453f);
+                    uint32_t cHalf = c.ConstF(0.5f);
+                    uint32_t cLumR = c.ConstF(0.2126f);
+                    uint32_t cLumG = c.ConstF(0.7152f);
+                    uint32_t cLumB = c.ConstF(0.0722f);
+                    uint32_t cKnee = c.ConstF(0.44f);
+                    uint32_t cSlope = c.ConstF(1.85f);
+                    uint32_t cW65 = c.ConstF(0.65f);
+                    uint32_t cW35 = c.ConstF(0.35f);
+                    uint32_t cEdgeCap = c.ConstF(0.35f);
+                    uint32_t cGrainAmp = c.ConstF(0.035f);
+                    uint32_t cSpecBase = c.ConstF(0.14f);
+                    uint32_t cSpecGrain = c.ConstF(0.06f);
+                    uint32_t cEdgeBase = c.ConstF(0.09f);
+                    uint32_t cEdgeLum = c.ConstF(0.08f);
+                    uint32_t cBncScale = c.ConstF(1.4f);
+                    uint32_t cBncR = c.ConstF(0.012f);
+                    uint32_t cBncG = c.ConstF(0.016f);
+                    uint32_t cBncB = c.ConstF(0.024f);
+
+                    uint32_t pX = gExt1(GLSL_Floor, fOp2(OPC_FMUL, fcX, cCell));
+                    uint32_t pY = gExt1(GLSL_Floor, fOp2(OPC_FMUL, fcY, cCell));
+                    uint32_t dotXY = fOp2(OPC_FADD, fOp2(OPC_FMUL, pX, cHashX),
+                                          fOp2(OPC_FMUL, pY, cHashY));
+                    uint32_t rnd = gExt1(GLSL_Fract,
+                                         fOp2(OPC_FMUL, gExt1(GLSL_Sin, dotXY), cHashM));
+                    uint32_t grain = fOp2(OPC_FSUB, rnd, cHalf);
+
+                    uint32_t lumRG = fOp2(OPC_FADD, fOp2(OPC_FMUL, colR, cLumR),
+                                          fOp2(OPC_FMUL, colG, cLumG));
+                    uint32_t lum = fOp2(OPC_FADD, lumRG, fOp2(OPC_FMUL, colB, cLumB));
+                    uint32_t lumC = gExt3(GLSL_FClamp, lum, c.cZero, c.cTwo);
+
+                    uint32_t dX = c.id();
+                    c.fn.op(OPC_DPDX, {c.tFloat, dX, lumC});
+                    uint32_t dY = c.id();
+                    c.fn.op(OPC_DPDY, {c.tFloat, dY, lumC});
+                    uint32_t edge = gExt2(GLSL_FMin,
+                                          fOp2(OPC_FADD, gExt1(GLSL_FAbs, dX),
+                                               gExt1(GLSL_FAbs, dY)),
+                                          cEdgeCap);
+
+                    uint32_t lumSub = gExt2(GLSL_FMax, fOp2(OPC_FSUB, lumC, cKnee),
+                                            c.cZero);
+                    uint32_t lumNorm = gExt2(GLSL_FMin, fOp2(OPC_FMUL, lumSub, cSlope),
+                                             c.cOne);
+                    uint32_t spec2 = fOp2(OPC_FMUL, lumNorm, lumNorm);
+                    uint32_t spec = fOp2(
+                        OPC_FMUL, spec2,
+                        fOp2(OPC_FADD, cW65, fOp2(OPC_FMUL, lumNorm, cW35)));
+
+                    uint32_t grainMod = fOp2(OPC_FADD, c.cOne,
+                                             fOp2(OPC_FMUL, grain, cGrainAmp));
+                    uint32_t specTerm = fOp2(
+                        OPC_FMUL, spec,
+                        fOp2(OPC_FADD, cSpecBase, fOp2(OPC_FMUL, grain, cSpecGrain)));
+                    uint32_t edgeTerm = fOp2(
+                        OPC_FMUL, edge,
+                        fOp2(OPC_FADD, cEdgeBase, fOp2(OPC_FMUL, lumNorm, cEdgeLum)));
+                    uint32_t hiAdd = fOp2(OPC_FADD, specTerm, edgeTerm);
+
+                    uint32_t invLum = gExt2(GLSL_FMax,
+                                            fOp2(OPC_FSUB, c.cOne, lumNorm), c.cZero);
+                    uint32_t midLum = gExt2(GLSL_FMin,
+                                            fOp2(OPC_FMUL, lumC, cBncScale), c.cOne);
+                    uint32_t bounce = fOp2(OPC_FMUL, invLum, midLum);
+
+                    uint32_t outR = gExt2(
+                        GLSL_FMax,
+                        fOp2(OPC_FADD, fOp2(OPC_FMUL, colR, grainMod),
+                             fOp2(OPC_FADD, hiAdd, fOp2(OPC_FMUL, bounce, cBncR))),
+                        c.cZero);
+                    uint32_t outG = gExt2(
+                        GLSL_FMax,
+                        fOp2(OPC_FADD, fOp2(OPC_FMUL, colG, grainMod),
+                             fOp2(OPC_FADD, hiAdd, fOp2(OPC_FMUL, bounce, cBncG))),
+                        c.cZero);
+                    uint32_t outB = gExt2(
+                        GLSL_FMax,
+                        fOp2(OPC_FADD, fOp2(OPC_FMUL, colB, grainMod),
+                             fOp2(OPC_FADD, hiAdd, fOp2(OPC_FMUL, bounce, cBncB))),
+                        c.cZero);
+
+                    uint32_t modVal = c.id();
+                    c.fn.op(OPC_COMPOSITE_CONSTRUCT,
+                            {c.tVec4, modVal, outR, outG, outB, colA});
+                    finalVal = modVal;
                 }
                 c.fn.op(OPC_STORE, {itReal->second, finalVal});
             }

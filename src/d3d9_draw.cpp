@@ -1,5 +1,8 @@
 #include "d3d9_internal.h"
 #include "stud_shadows.h"
+#include "post_fx.h"
+#include <algorithm>
+#include <cmath>
 #include <intrin.h>
 
 using namespace d3d9;
@@ -16,6 +19,14 @@ VkSampler GetSamplerForStage(uint32_t stage, bool depthCompare) {
         borderClass = (r + g + b >= 384u) ? 1u : 2u;
     }
 
+    GpuTexture* tex = g_resources.TextureOf(g_st.textures[stage]);
+    const bool world3DSampler = !depthCompare && tex && !tex->renderTarget &&
+                                !tex->depth && !tex->volume && tex->levels > 1 &&
+                                s.minFilter != 1;
+    const float effectiveBias = world3DSampler ? (s.mipLodBias - 0.5f) : s.mipLodBias;
+    const uint32_t biasQ =
+        (uint32_t)(std::clamp((int)std::lround(effectiveBias * 8.0f), -128, 127) & 0xFF);
+
     uint32_t key = (s.addressU & 7);
     key |= (s.addressV & 7) << 3;
     key |= (s.addressW & 7) << 6;
@@ -25,6 +36,8 @@ VkSampler GetSamplerForStage(uint32_t stage, bool depthCompare) {
     key |= (s.maxAnisotropy & 0x1F) << 15;
     key |= borderClass << 20;
     key |= (depthCompare ? 1u : 0u) << 22;
+    key |= (world3DSampler ? 1u : 0u) << 23;
+    key |= biasQ << 24;
 
     if (!s.samplerDirty && s.cachedSampler && s.lastKey == key)
         return s.cachedSampler;
@@ -48,6 +61,15 @@ VkSampler GetSamplerForStage(uint32_t stage, bool depthCompare) {
         }
     };
 
+    const bool anisoSupported = g_backend.SamplerAnisotropySupported();
+    const bool wantAniso =
+        anisoSupported &&
+        (world3DSampler || s.minFilter == 3 || s.magFilter == 3 || s.maxAnisotropy > 1);
+    const float reqAniso =
+        world3DSampler ? g_backend.MaxAnisotropy()
+                       : std::min((float)(s.maxAnisotropy ? s.maxAnisotropy : 1),
+                                  g_backend.MaxAnisotropy());
+
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sci.magFilter = (s.magFilter == 1) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
     sci.minFilter = (s.minFilter == 1) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
@@ -56,13 +78,9 @@ VkSampler GetSamplerForStage(uint32_t stage, bool depthCompare) {
     sci.addressModeU = addressMode(s.addressU);
     sci.addressModeV = addressMode(s.addressV);
     sci.addressModeW = addressMode(s.addressW);
-    sci.mipLodBias = s.mipLodBias;
-    sci.anisotropyEnable =
-        (s.minFilter == 3 || s.magFilter == 3 || s.maxAnisotropy > 1) ? VK_TRUE
-                                                                     : VK_FALSE;
-    sci.maxAnisotropy =
-        sci.anisotropyEnable ? (float)(s.maxAnisotropy ? s.maxAnisotropy : 1)
-                             : 1.0f;
+    sci.mipLodBias = effectiveBias;
+    sci.anisotropyEnable = wantAniso ? VK_TRUE : VK_FALSE;
+    sci.maxAnisotropy = wantAniso ? std::max(1.0f, reqAniso) : 1.0f;
     sci.compareEnable = depthCompare ? VK_TRUE : VK_FALSE;
     sci.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
     sci.minLod = 0.0f;
@@ -272,11 +290,41 @@ void TranslateDraw(uint32_t topo, int32_t baseVertex, uint32_t startIndex,
                 if (g_studShadows.FlushScene()) {
                     ResetDrawCache();
                 }
+                if (g_postFx.FlushScenePass(sc, g_studShadows.DepthSurface())) {
+                    ResetDrawCache();
+                }
                 break;
             }
         }
     }
+    if (g_postFx.NeedsSceneFlush()) {
+        FakeSurface* sc = g_postFx.SceneColor();
+        const uint16_t checkMask = g_st.rtStageMask & g_st.texMask;
+        for (uint32_t m = checkMask; m; ) {
+            unsigned long s = 0;
+            _BitScanForward(&s, m);
+            m &= m - 1u;
+            GpuTexture* t = g_resources.TextureOf(g_st.textures[s]);
+            if (t && sc && t->image == sc->image) {
+                if (g_postFx.FlushScenePass()) {
+                    ResetDrawCache();
+                }
+                break;
+            }
+        }
+    }
+    const bool readsRt = (g_st.rtStageMask & g_st.texMask) != 0;
+    if ((!g_st.colorTargets[0] || g_st.colorTargets[0]->isBackbuffer) &&
+        g_postFx.HasSceneThisFrame() && !g_postFx.IsBackbufferPostDone() &&
+        !g_st.rs[RS_ZENABLE] && !readsRt) {
+        if (g_postFx.FlushBeforeHud()) {
+            ResetDrawCache();
+        }
+    }
     g_studShadows.TrackTargetDraw(g_st.colorTargets[0], g_st.depthTarget);
+    g_postFx.TrackDraw(g_st.colorTargets[0], g_st.colorTargets[1], g_st.depthTarget,
+                       g_st.rs[RS_ZENABLE] != 0, g_st.rs[RS_ZWRITEENABLE] != 0,
+                       g_curPipeKey.colorWrite, readsRt, topo, primCount);
     if (!indexed && topo == 4 && primCount == 2 && activeMask == 0x1 &&
         g_st.streams[0].stride == 28 &&
         g_st.vsHash == 0xda91b812e150759fULL &&

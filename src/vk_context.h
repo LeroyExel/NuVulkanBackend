@@ -109,6 +109,21 @@ public:
     VmaAllocator Allocator() const { return allocator; }
     bool Eds3Enabled() const { return eds3; }
     bool HasDepthClip() const { return hasDepthClip_; }
+    bool SamplerAnisotropySupported() const { return hasSamplerAniso_; }
+    float MaxAnisotropy() const { return maxAnisotropy_; }
+    VkImage SwapchainImage() const {
+        return imageIndex < images.size() ? images[imageIndex] : VK_NULL_HANDLE;
+    }
+    VkImageView SwapchainView() const {
+        return imageIndex < views.size() ? views[imageIndex] : VK_NULL_HANDLE;
+    }
+    VkFormat SwapchainColorFormat() const { return colorFormat; }
+    VkImage SwapchainDepthImage() const { return depthImage; }
+    VkImageView SwapchainDepthSampleView() const { return depthSampleView; }
+    VkFormat SwapchainDepthFormat() const { return depthFormat; }
+    bool SwapchainSampleable() const { return swapchainSampleable_; }
+    bool SwapchainTransferSrc() const { return swapchainTransferSrc_; }
+    void ForgetImage(VkImage image) { layouts_.erase(image); }
     uint32_t MinUboAlign() const { return minUboAlign; }
     uint32_t FrameSlot() const { return frameIndex; }
     uint32_t FrameNumber() const { return frameCounter; }
@@ -164,6 +179,9 @@ private:
     VkImage depthImage = VK_NULL_HANDLE;
     VmaAllocation depthAlloc = VK_NULL_HANDLE;
     VkImageView depthView = VK_NULL_HANDLE;
+    VkImageView depthSampleView = VK_NULL_HANDLE;
+    bool swapchainSampleable_ = false;
+    bool swapchainTransferSrc_ = false;
 
     struct DepthTarget {
         VkImage image = VK_NULL_HANDLE;
@@ -213,6 +231,8 @@ private:
     uint32_t ringRange_ = 0;
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
     bool hasDepthClip_ = false;
+    bool hasSamplerAniso_ = false;
+    float maxAnisotropy_ = 1.0f;
 
     VkSampler defaultSampler = VK_NULL_HANDLE;
     VkImage defaultImage = VK_NULL_HANDLE;

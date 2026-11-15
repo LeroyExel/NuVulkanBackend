@@ -1,5 +1,6 @@
 #include "vk_context.h"
 #include "fps_overlay.h"
+#include "post_fx.h"
 #include "stud_shadows.h"
 
 #define XXH_INLINE_ALL
@@ -103,6 +104,12 @@ bool VkBackend::Init(HWND hwndIn, uint32_t width, uint32_t height) {
     enable13.dynamicRendering = VK_TRUE;
     enable13.synchronization2 = VK_TRUE;
 
+    VkPhysicalDeviceFeatures2 enable2{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    hasSamplerAniso_ = f2.features.samplerAnisotropy == VK_TRUE;
+    enable2.features.samplerAnisotropy = f2.features.samplerAnisotropy;
+    enable2.pNext = &enable13;
+
     // Enable VK_EXT_device_fault when the driver has it: a lost device then
     // reports the faulting address and what kind of access it was, instead of
     // only VK_ERROR_DEVICE_LOST.
@@ -150,7 +157,7 @@ bool VkBackend::Init(HWND hwndIn, uint32_t width, uint32_t height) {
     }
 
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    dci.pNext = &enable13;
+    dci.pNext = &enable2;
     dci.queueCreateInfoCount = qcount;
     dci.pQueueCreateInfos = qci;
     dci.enabledExtensionCount = devExtCount;
@@ -183,6 +190,11 @@ bool VkBackend::Init(HWND hwndIn, uint32_t width, uint32_t height) {
 
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(phys, &props);
+    maxAnisotropy_ = hasSamplerAniso_
+                         ? (props.limits.maxSamplerAnisotropy < 16.0f
+                                ? props.limits.maxSamplerAnisotropy
+                                : 16.0f)
+                         : 1.0f;
     minUboAlign = (uint32_t)props.limits.minUniformBufferOffsetAlignment;
     if (minUboAlign < 64) minUboAlign = 64;
     LOG("[vk] %s | api %u.%u.%u | minUboAlign=%u | eds3=%d", props.deviceName,
@@ -291,6 +303,7 @@ bool VkBackend::Init(HWND hwndIn, uint32_t width, uint32_t height) {
     descCache.reserve(1024);
     g_fpsOverlay.Init();
     g_studShadows.Init();
+    g_postFx.Init();
     targetCount = 0;
     targetDepthFormat = depthFormat;
     targetW = extent.width;
@@ -547,7 +560,16 @@ bool VkBackend::CreateSwapchainObjects() {
     sci.imageColorSpace = colorSpace;
     sci.imageExtent = extent;
     sci.imageArrayLayers = 1;
-    sci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    VkImageUsageFlags swapUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    swapchainTransferSrc_ =
+        (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
+    swapchainSampleable_ =
+        (caps.supportedUsageFlags & VK_IMAGE_USAGE_SAMPLED_BIT) != 0;
+    if (swapchainTransferSrc_) swapUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+        swapUsage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (swapchainSampleable_) swapUsage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    sci.imageUsage = swapUsage;
     uint32_t families[2] = {gfxFamily, presentFamily};
     if (gfxFamily != presentFamily) {
         sci.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
@@ -618,7 +640,8 @@ bool VkBackend::CreateSwapchainObjects() {
     dci.arrayLayers = 1;
     dci.samples = VK_SAMPLE_COUNT_1_BIT;
     dci.tiling = VK_IMAGE_TILING_OPTIMAL;
-    dci.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    dci.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     VmaAllocationCreateInfo aci{};
     aci.usage = VMA_MEMORY_USAGE_AUTO;
     vmaCreateImage(allocator, &dci, &aci, &depthImage, &depthAlloc, nullptr);
@@ -629,12 +652,16 @@ bool VkBackend::CreateSwapchainObjects() {
     dvci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
                              0, 1, 0, 1};
     vkCreateImageView(device, &dvci, nullptr, &depthView);
+    dvci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    vkCreateImageView(device, &dvci, nullptr, &depthSampleView);
     return true;
 }
 
 void VkBackend::DestroySwapchainObjects() {
+    if (depthSampleView) vkDestroyImageView(device, depthSampleView, nullptr);
     if (depthView) vkDestroyImageView(device, depthView, nullptr);
     if (depthImage) vmaDestroyImage(allocator, depthImage, depthAlloc);
+    depthSampleView = VK_NULL_HANDLE;
     depthView = VK_NULL_HANDLE;
     depthImage = VK_NULL_HANDLE;
     depthAlloc = VK_NULL_HANDLE;
@@ -658,7 +685,9 @@ bool VkBackend::RecreateSwapchain(uint32_t width, uint32_t height) {
     vkDeviceWaitIdle(device);
     renderingActive = false;
     DestroySwapchainObjects();
-    return CreateSwapchainObjects();
+    if (!CreateSwapchainObjects()) return false;
+    g_postFx.OnSwapchainRecreated();
+    return true;
 }
 
 bool VkBackend::BeginFrame() {
@@ -1113,6 +1142,7 @@ void VkBackend::WaitIdle() {
 void VkBackend::Shutdown() {
     if (!device) return;
     vkDeviceWaitIdle(device);
+    g_postFx.Shutdown();
     g_studShadows.Shutdown();
     g_fpsOverlay.Shutdown();
     memset(texMru_, 0, sizeof(texMru_));

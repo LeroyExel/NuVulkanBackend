@@ -19,6 +19,7 @@ public:
                sceneColor_ != nullptr && gbufDepth_ != nullptr;
     }
     FakeSurface* SceneColor() const { return sceneColor_; }
+    FakeSurface* DepthSurface() const { return gbufDepth_; }
     bool FlushScene();
     bool FlushBeforeDepthClear(FakeSurface* depth);
     bool FlushIfReading(FakeSurface* texSurf);
