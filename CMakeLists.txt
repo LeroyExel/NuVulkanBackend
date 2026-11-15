@@ -20,6 +20,7 @@ add_library(NuVulkanBackend SHARED
     src/pso_cache.cpp
     src/fps_overlay.cpp
     src/stud_shadows.cpp
+    src/post_fx.cpp
     src/d3d9_device.cpp
     src/d3d9_draw.cpp
     src/d3d9_factory.cpp

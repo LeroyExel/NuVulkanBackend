@@ -19,14 +19,14 @@ std::string ShaderDB::PathFor(uint64_t hash, bool pixel, const char* ext) const 
     // otherwise keep loading modules produced by the old emitter. Bump the tag
     // whenever sm3_to_spirv.cpp changes.
     char buf[MAX_PATH];
-    snprintf(buf, sizeof(buf), "%s\\v34_%016llx_%s%s", dir_.c_str(),
+    snprintf(buf, sizeof(buf), "%s\\v35_%016llx_%s%s", dir_.c_str(),
              (unsigned long long)hash, pixel ? "ps" : "vs", ext);
     return buf;
 }
 
 std::string ShaderDB::VariantPathFor(uint64_t hash, uint32_t drefMask) const {
     char buf[MAX_PATH];
-    snprintf(buf, sizeof(buf), "%s\\v34_%016llx_d%x_ps.spv", dir_.c_str(),
+    snprintf(buf, sizeof(buf), "%s\\v35_%016llx_d%x_ps.spv", dir_.c_str(),
              (unsigned long long)hash, drefMask);
     return buf;
 }
